@@ -79,7 +79,7 @@ def download_and_upload_to_minio(**kwargs):
 
 # 3. DAG 정의
 with DAG(
-    dag_id='01_ingest_taxi_data',
+    dag_id='01_ingest_taxi_data_yyyymmdd',
     default_args=default_args,
     schedule=None,
     tags=['portfolio', 'ingestion'],
