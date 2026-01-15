@@ -1,10 +1,19 @@
+import sys
+import os
 from airflow import DAG
-import pendulum
-# 방금 만든 커스텀 오퍼레이터 임포트 (경로 주의)
-# airflow는 plugins 폴더를 자동으로 스캔하므로 바로 import 가능하거나, 
-# 경로가 안 잡히면 sys.path.append를 써야 할 수도 있습니다.
-# 보통은 아래처럼 씁니다.
+
+
+# 1. plugins 폴더를 파이썬 라이브러리 경로에 강제로 추가합니다.
+# (Docker 환경에서 보통 /opt/airflow/plugins 입니다)
+sys.path.append(os.path.join(os.environ['AIRFLOW_HOME'], 'plugins'))
+
+# 2. 이제 에러 없이 import가 될 것입니다.
 from operators.http_to_s3_custom import YearMonthRangeToS3Operator
+from airflow.operators.python import PythonOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+import requests
+import pendulum
+import io
 
 default_args = {
     'owner': 'airflow',
