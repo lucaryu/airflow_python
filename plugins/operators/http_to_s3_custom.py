@@ -1,6 +1,6 @@
 from airflow.models import BaseOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.utils.decorators import apply_defaults
+# [삭제됨] from airflow.utils.decorators import apply_defaults  <-- 더 이상 필요 없음
 import requests
 import pendulum
 import io
@@ -14,7 +14,7 @@ class YearMonthRangeToS3Operator(BaseOperator):
     # Airflow UI나 DAG에서 Jinja Template({{ }})을 쓸 수 있게 허용할 필드들
     template_fields = ('from_date', 'to_date', 'base_url', 's3_key')
 
-    @apply_defaults
+    # [삭제됨] @apply_defaults  <-- 이것도 지워야 함!
     def __init__(
         self,
         aws_conn_id,
@@ -29,8 +29,8 @@ class YearMonthRangeToS3Operator(BaseOperator):
         super().__init__(*args, **kwargs)
         self.aws_conn_id = aws_conn_id
         self.bucket_name = bucket_name
-        self.base_url = base_url   # 예: .../yellow_tripdata_{year}-{month}.parquet
-        self.s3_key = s3_key       # 예: taxi/year={year}/month={month}/...
+        self.base_url = base_url
+        self.s3_key = s3_key
         self.from_date = from_date
         self.to_date = to_date
 
