@@ -16,7 +16,6 @@ default_args = {
 
 def load_parquet_to_oracle(**kwargs):
     # 날짜 파라미터 받기 (예: 2023-01)
-    # 테스트를 위해 고정값 사용하거나 logical_date 사용 가능
     year = '2023'
     month = '01'
     
@@ -32,14 +31,13 @@ def load_parquet_to_oracle(**kwargs):
     if not file_obj:
         raise Exception("파일이 없습니다!")
 
-    # BytesIO를 통해 Pandas로 읽기 (pyarrow 엔진 필요)
+    # BytesIO를 통해 Pandas로 읽기
     data_stream = io.BytesIO(file_obj.get()['Body'].read())
     df = pd.read_parquet(data_stream)
     
     print(f"2. 데이터 로드 완료. 행 개수: {len(df)}")
     
-    # --- 데이터 전처리 (Oracle 컬럼명과 타입에 맞추기) ---
-    # 컬럼명 매핑 (Parquet -> Oracle)
+    # --- 데이터 전처리 ---
     df = df.rename(columns={
         'VendorID': 'VENDOR_ID',
         'tpep_pickup_datetime': 'TPEP_PICKUP_DATETIME',
@@ -62,7 +60,6 @@ def load_parquet_to_oracle(**kwargs):
         'airport_fee': 'AIRPORT_FEE'
     })
     
-    # 필요한 컬럼만 선택 & 대문자 변환
     target_columns = [
         'VENDOR_ID', 'TPEP_PICKUP_DATETIME', 'TPEP_DROPOFF_DATETIME', 
         'PASSENGER_COUNT', 'TRIP_DISTANCE', 'RATE_CODE_ID', 
@@ -72,28 +69,35 @@ def load_parquet_to_oracle(**kwargs):
         'TOTAL_AMOUNT', 'CONGESTION_SURCHARGE', 'AIRPORT_FEE'
     ]
     
-    # 없는 컬럼은 0으로 채우거나 제외 (안전장치)
     for col in target_columns:
         if col not in df.columns:
             df[col] = None
 
-    df = df[target_columns] # 순서 맞추기
-    
-    # NaN(결측치) 처리 -> Oracle에서는 NULL로 들어가게 처리하거나 0으로 치환
+    df = df[target_columns]
     df = df.fillna(0)
 
     print("3. Oracle 적재 시작")
     
-    # OracleHook 사용
+    # --- [수정된 연결 로직] ---
     oracle_hook = OracleHook(oracle_conn_id='oracle_conn')
+    conn_info = oracle_hook.get_connection('oracle_conn')
     
-    # oracledb의 thin 모드 사용 (Instant Client 없이 접속)
-    # Airflow Connection 정보를 가져와서 직접 연결 생성
-    conn = oracle_hook.get_conn()
+    # Service Name 결정 (UI Schema 필드에 있으면 그거 쓰고, 없으면 Oracle23ai)
+    service_name = conn_info.schema if conn_info.schema else 'Oracle23ai'
+    
+    # DSN 수동 생성 (IP:Port/Service_Name) -> 이러면 TNS 설정을 안 찾습니다.
+    dsn = f"{conn_info.host}:{conn_info.port}/{service_name}"
+    
+    print(f"   -> 접속 시도: {dsn}")
+
+    # oracledb 직접 연결
+    conn = oracledb.connect(
+        user=conn_info.login,
+        password=conn_info.password,
+        dsn=dsn
+    )
     cursor = conn.cursor()
     
-    # 배치 처리를 위한 데이터 변환 (DataFrame -> List of Tuples)
-    # 성능을 위해 1000건씩 끊어서 넣거나 executemany 사용
     rows = [tuple(x) for x in df.to_numpy()]
     
     insert_sql = f"""
@@ -101,7 +105,6 @@ def load_parquet_to_oracle(**kwargs):
     VALUES ({', '.join([':' + str(i+1) for i in range(len(target_columns))])})
     """
     
-    # 대량 데이터(Batch) 입력
     batch_size = 5000
     total_rows = len(rows)
     
