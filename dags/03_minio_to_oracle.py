@@ -7,7 +7,7 @@ import pendulum
 import io
 import oracledb
 
-# 1. 설정
+# 1. 기본 설정
 default_args = {
     'owner': 'airflow',
     'start_date': pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
@@ -15,29 +15,31 @@ default_args = {
 }
 
 def load_parquet_to_oracle(**kwargs):
-    # 날짜 파라미터 받기 (예: 2023-01)
+    # ---------------------------------------------------------
+    # 1. 데이터 다운로드 (MinIO)
+    # ---------------------------------------------------------
     year = '2023'
     month = '01'
-    
     bucket_name = 'bronze'
     file_key = f'taxi/year={year}/month={month}/yellow_tripdata_{year}-{month}.parquet'
     
     print(f"1. MinIO에서 데이터 읽기 시작: {file_key}")
     
-    # S3Hook으로 파일 다운로드 (메모리)
     s3_hook = S3Hook(aws_conn_id='minio_conn')
     file_obj = s3_hook.get_key(key=file_key, bucket_name=bucket_name)
     
     if not file_obj:
         raise Exception("파일이 없습니다!")
 
-    # BytesIO를 통해 Pandas로 읽기
+    # Parquet 읽기
     data_stream = io.BytesIO(file_obj.get()['Body'].read())
     df = pd.read_parquet(data_stream)
     
     print(f"2. 데이터 로드 완료. 행 개수: {len(df)}")
     
-    # --- 데이터 전처리 ---
+    # ---------------------------------------------------------
+    # 2. 데이터 전처리 (컬럼 매핑 & 결측치 처리)
+    # ---------------------------------------------------------
     df = df.rename(columns={
         'VendorID': 'VENDOR_ID',
         'tpep_pickup_datetime': 'TPEP_PICKUP_DATETIME',
@@ -60,6 +62,7 @@ def load_parquet_to_oracle(**kwargs):
         'airport_fee': 'AIRPORT_FEE'
     })
     
+    # Oracle 테이블 순서와 맞추기
     target_columns = [
         'VENDOR_ID', 'TPEP_PICKUP_DATETIME', 'TPEP_DROPOFF_DATETIME', 
         'PASSENGER_COUNT', 'TRIP_DISTANCE', 'RATE_CODE_ID', 
@@ -69,26 +72,31 @@ def load_parquet_to_oracle(**kwargs):
         'TOTAL_AMOUNT', 'CONGESTION_SURCHARGE', 'AIRPORT_FEE'
     ]
     
+    # 없는 컬럼은 None으로 채우기
     for col in target_columns:
         if col not in df.columns:
             df[col] = None
 
     df = df[target_columns]
+    
+    # NaN(결측치)를 0이나 빈 값으로 채우기 (Oracle 에러 방지)
     df = df.fillna(0)
 
-    print("3. Oracle 적재 시작")
+    # ---------------------------------------------------------
+    # 3. Oracle 적재 (메모리 절약형 Chunk Processing)
+    # ---------------------------------------------------------
+    print("3. Oracle 연결 시도")
     
-    # --- [수정된 연결 로직] ---
+    # Airflow Connection 정보 가져오기
     oracle_hook = OracleHook(oracle_conn_id='oracle_conn')
     conn_info = oracle_hook.get_connection('oracle_conn')
     
-    # Service Name 결정 (UI Schema 필드에 있으면 그거 쓰고, 없으면 Oracle23ai)
+    # Service Name 설정 (UI Schema에 값이 없으면 기본값 Oracle23ai 사용)
     service_name = conn_info.schema if conn_info.schema else 'Oracle23ai'
     
-    # DSN 수동 생성 (IP:Port/Service_Name) -> 이러면 TNS 설정을 안 찾습니다.
+    # DSN 수동 생성 (TNS 에러 방지용)
     dsn = f"{conn_info.host}:{conn_info.port}/{service_name}"
-    
-    print(f"   -> 접속 시도: {dsn}")
+    print(f"   -> 접속 정보: {dsn}")
 
     # oracledb 직접 연결
     conn = oracledb.connect(
@@ -97,32 +105,50 @@ def load_parquet_to_oracle(**kwargs):
         dsn=dsn
     )
     cursor = conn.cursor()
-    
-    rows = [tuple(x) for x in df.to_numpy()]
-    
+
+    # 쿼리 준비
     insert_sql = f"""
     INSERT INTO TAXI_DATA ({', '.join(target_columns)}) 
     VALUES ({', '.join([':' + str(i+1) for i in range(len(target_columns))])})
     """
     
-    batch_size = 5000
-    total_rows = len(rows)
+    # [핵심] 메모리 절약을 위한 제너레이터 사용
+    # df.to_numpy()로 전체 변환하지 않고, 한 줄씩 꺼내 씁니다.
+    data_generator = df.itertuples(index=False, name=None)
     
-    for i in range(0, total_rows, batch_size):
-        batch = rows[i:i + batch_size]
+    batch_size = 5000  # 5000개씩 끊어서 적재
+    batch = []
+    total_count = 0
+    
+    print(f"4. 적재 시작 (배치 사이즈: {batch_size})")
+
+    for row in data_generator:
+        batch.append(row)
+        
+        # 배치가 꽉 차면 DB에 밀어넣고 메모리 비움
+        if len(batch) >= batch_size:
+            cursor.executemany(insert_sql, batch)
+            conn.commit()
+            total_count += len(batch)
+            print(f"   -> {total_count} 건 적재 완료...")
+            batch = []  # 메모리 초기화
+            
+    # 남은 데이터 처리
+    if batch:
         cursor.executemany(insert_sql, batch)
         conn.commit()
-        print(f"   -> {i + len(batch)} / {total_rows} 건 적재 완료")
+        total_count += len(batch)
+        print(f"   -> {total_count} 건 적재 완료 (최종)")
 
     cursor.close()
     conn.close()
-    print("✅ Oracle 적재 완료!")
+    print("✅ Oracle 적재가 성공적으로 완료되었습니다!")
 
 with DAG(
     dag_id='03_minio_to_oracle',
     default_args=default_args,
     schedule=None,
-    tags=['portfolio', 'oracle', 'elt'],
+    tags=['portfolio', 'oracle', 'elt', 'optimized'],
 ) as dag:
 
     load_task = PythonOperator(
