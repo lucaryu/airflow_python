@@ -9,15 +9,15 @@ import oracledb
 import pyarrow.parquet as pq
 import gc
 import time
-from datetime import timedelta # [필수] 타임아웃 설정을 위해 추가
+from datetime import timedelta
 
 # 1. 기본 설정
 default_args = {
     'owner': 'airflow',
     'start_date': pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     'catchup': False,
-    # [핵심 해결책] 작업 제한 시간을 3시간으로 늘림 (기본값은 보통 1시간)
-    'execution_timeout': timedelta(hours=3) 
+    # 넉넉하게 5시간 설정 (안전빵)
+    'execution_timeout': timedelta(hours=5) 
 }
 
 def load_parquet_to_oracle(**kwargs):
@@ -72,16 +72,20 @@ def load_parquet_to_oracle(**kwargs):
     VALUES ({', '.join([':' + str(i+1) for i in range(len(target_columns))])})
     """
 
-    # [수정] 1000은 너무 느려서 타임아웃 걸림 -> 3000으로 상향 (메모리 안전권)
-    BATCH_SIZE = 3000 
+    # [수정] 3000 -> 1000 (Oracle Free 버전이 소화하기 편한 크기)
+    BATCH_SIZE = 1000 
     total_count = 0
     
-    print(f"3. 스트리밍 적재 시작 (Batch Size: {BATCH_SIZE}, 0.05s Delay)")
+    # [수정] 0.05초 -> 0.1초 (Oracle DB가 디스크에 쓸 시간을 충분히 줌)
+    SLEEP_TIME = 0.1
+    
+    print(f"3. 스트리밍 적재 시작 (Batch: {BATCH_SIZE}, Sleep: {SLEEP_TIME}s)")
 
     for i, batch in enumerate(parquet_file.iter_batches(batch_size=BATCH_SIZE)):
         try:
             df_chunk = batch.to_pandas()
             
+            # 전처리
             df_chunk = df_chunk.rename(columns={
                 'VendorID': 'VENDOR_ID',
                 'tpep_pickup_datetime': 'TPEP_PICKUP_DATETIME',
@@ -116,15 +120,17 @@ def load_parquet_to_oracle(**kwargs):
             
             total_count += len(rows)
             
-            if (i + 1) % 5 == 0: # 로그 출력 빈도 조절
+            # 로그는 10,000건마다 출력
+            if (i + 1) % 10 == 0: 
                 print(f"   -> [Chunk {i+1}] 누적 {total_count} 건 적재 완료")
 
+            # 메모리 청소
             del df_chunk
             del rows
             gc.collect() 
             
-            # [수정] 휴식 시간을 0.1초 -> 0.05초로 단축 (속도 2배)
-            time.sleep(0.05)
+            # 휴식
+            time.sleep(SLEEP_TIME)
 
         except Exception as e:
             print(f"   -> [Chunk {i+1}] 에러 발생: {e}")
