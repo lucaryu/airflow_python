@@ -16,34 +16,37 @@ default_args = {
     'owner': 'airflow',
     'start_date': pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     'catchup': False,
-    'execution_timeout': timedelta(hours=5) 
+    'execution_timeout': timedelta(hours=5) # 안전하게 시간 넉넉히
 }
 
-def get_oracle_conn(conn_info):
+def load_parquet_to_oracle(**kwargs):
+    # ---------------------------------------------------------
+    # 1. Oracle 연결
+    # ---------------------------------------------------------
+    print("1. Oracle 연결 준비")
+    oracle_hook = OracleHook(oracle_conn_id='oracle_conn')
+    conn_info = oracle_hook.get_connection('oracle_conn')
+    
     service_name = conn_info.schema if conn_info.schema else 'Oracle23ai'
     dsn = f"{conn_info.host}:{conn_info.port}/{service_name}"
+    
     conn = oracledb.connect(
         user=conn_info.login,
         password=conn_info.password,
         dsn=dsn
     )
-    return conn
-
-def load_parquet_to_oracle(**kwargs):
-    oracle_hook = OracleHook(oracle_conn_id='oracle_conn')
-    conn_info = oracle_hook.get_connection('oracle_conn')
-    
-    conn = get_oracle_conn(conn_info)
     cursor = conn.cursor()
-    print("1. Oracle 최초 연결 성공")
+    print(f"   -> Oracle 접속 성공: {dsn}")
 
     # ---------------------------------------------------------
-    # MinIO 연결
+    # 2. MinIO 스트리밍 준비
     # ---------------------------------------------------------
     year = '2023'
     month = '01'
     bucket_name = 'bronze'
     file_key = f'taxi/year={year}/month={month}/yellow_tripdata_{year}-{month}.parquet'
+    
+    print(f"2. MinIO 파일 열기 (Streaming): {file_key}")
     
     s3_hook = S3Hook(aws_conn_id='minio_conn')
     file_obj = s3_hook.get_key(key=file_key, bucket_name=bucket_name)
@@ -55,7 +58,7 @@ def load_parquet_to_oracle(**kwargs):
     parquet_file = pq.ParquetFile(data_stream)
     
     # ---------------------------------------------------------
-    # 컬럼 정의
+    # 3. 스트리밍 적재
     # ---------------------------------------------------------
     target_columns = [
         'VENDOR_ID', 'TPEP_PICKUP_DATETIME', 'TPEP_DROPOFF_DATETIME', 
@@ -66,19 +69,15 @@ def load_parquet_to_oracle(**kwargs):
         'TOTAL_AMOUNT', 'CONGESTION_SURCHARGE', 'AIRPORT_FEE'
     ]
     
-    # [수정] 문자열로 처리해야 할 컬럼 지정 (이 컬럼들은 0 대신 'N'이나 빈칸으로 채움)
-    string_columns = ['STORE_AND_FWD_FLAG', 'VENDOR_ID'] 
-
     insert_sql = f"""
     INSERT INTO TAXI_DATA ({', '.join(target_columns)}) 
     VALUES ({', '.join([':' + str(i+1) for i in range(len(target_columns))])})
     """
 
-    BATCH_SIZE = 2000
-    RECONNECT_SIZE = 50000 
+    BATCH_SIZE = 2000  # 속도와 안정성의 균형점
     total_count = 0
     
-    print(f"3. 적재 시작 (Batch: {BATCH_SIZE}, Reconnect: {RECONNECT_SIZE})")
+    print(f"3. 스트리밍 적재 시작 (Batch: {BATCH_SIZE})")
 
     for i, batch in enumerate(parquet_file.iter_batches(batch_size=BATCH_SIZE)):
         try:
@@ -107,47 +106,39 @@ def load_parquet_to_oracle(**kwargs):
                 'airport_fee': 'AIRPORT_FEE'
             })
             
-            # 없는 컬럼 생성
+            # 없는 컬럼 채우기
             for col in target_columns:
                 if col not in df_chunk.columns:
                     df_chunk[col] = None
             
-            # [핵심 수정] 문자열 컬럼은 'N'으로 채우고, 나머지는 0으로 채움
-            # 이렇게 해야 VARCHAR 컬럼에 int(0)이 들어가는 에러를 막음
-            for str_col in string_columns:
-                if str_col in df_chunk.columns:
-                    # 빈 값을 문자열 'N'으로 채우고, 강제로 문자열 타입으로 변환
-                    df_chunk[str_col] = df_chunk[str_col].fillna('N').astype(str)
-            
-            # 나머지 숫자형 컬럼들의 결측치는 0으로 채움
-            df_chunk = df_chunk.fillna(0)
+            # ▼ [버그 수정] 문자열 컬럼은 0 대신 'N'으로 채움 (DPY-3013 해결)
+            if 'STORE_AND_FWD_FLAG' in df_chunk.columns:
+                df_chunk['STORE_AND_FWD_FLAG'] = df_chunk['STORE_AND_FWD_FLAG'].fillna('N').astype(str)
 
+            # 나머지는 0으로 채움 (숫자형)
+            df_chunk = df_chunk.fillna(0)
+            
             # 데이터 준비
             df_chunk = df_chunk[target_columns]
             rows = [tuple(x) for x in df_chunk.to_numpy()]
             
+            # DB 적재
             cursor.executemany(insert_sql, rows)
             conn.commit()
             
             total_count += len(rows)
             
+            # 로그 출력 (빈도 적절히 조절)
+            if (i + 1) % 50 == 0: 
+                print(f"   -> [Chunk {i+1}] 누적 {total_count} 건 적재 완료")
+
+            # 메모리 청소
             del df_chunk
             del rows
-            gc.collect()
-
-            if total_count % RECONNECT_SIZE == 0:
-                print(f"   🔄 [Clean-up] {total_count}건 달성. DB 세션 초기화 중...")
-                cursor.close()
-                conn.close()
-                time.sleep(1)
-                conn = get_oracle_conn(conn_info)
-                cursor = conn.cursor()
-                print(f"   ✅ [Resumed] DB 재연결 완료.")
+            gc.collect() 
             
-            elif total_count % 100000 == 0:
-                 print(f"   -> 누적 {total_count} 건 적재 진행 중...")
-
-            time.sleep(0.01)
+            # Oracle Free 버전을 위한 짧은 휴식
+            time.sleep(0.1)
 
         except Exception as e:
             print(f"   -> [Chunk {i+1}] 에러 발생: {e}")
