@@ -74,7 +74,7 @@ def load_parquet_to_oracle(**kwargs):
     VALUES ({', '.join([':' + str(i+1) for i in range(len(target_columns))])})
     """
 
-    BATCH_SIZE = 50000  # 속도와 안정성의 균형점
+    BATCH_SIZE = 100000  # 속도와 안정성의 균형점
     total_count = 0
     
     print(f"3. 스트리밍 적재 시작 (Batch: {BATCH_SIZE})")
