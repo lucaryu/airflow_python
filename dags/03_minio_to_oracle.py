@@ -138,7 +138,7 @@ def load_parquet_to_oracle(**kwargs):
             gc.collect() 
             
             # Oracle Free 버전을 위한 짧은 휴식
-            time.sleep(0.1)
+            # time.sleep(0.1)
 
         except Exception as e:
             print(f"   -> [Chunk {i+1}] 에러 발생: {e}")
