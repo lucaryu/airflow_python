@@ -31,7 +31,7 @@ with DAG(
     # 2. Custom Operator 호출
     # ---------------------------------------------------------
     load_taxi_data = S3ParquetToOracleOperator(
-        task_id='load_taxi_range',
+        task_id='05_s3_load_param',
         
         # 연결 정보 (고정값)
         oracle_conn_id='oracle_conn',
