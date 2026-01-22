@@ -1,5 +1,4 @@
 from airflow.models import BaseOperator
-# [삭제됨] from airflow.utils.decorators import apply_defaults  <-- 에러의 원인!
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.oracle.hooks.oracle import OracleHook
 import pandas as pd
@@ -14,13 +13,11 @@ class S3ParquetToOracleOperator(BaseOperator):
     """
     [Custom Operator]
     S3(MinIO)의 Parquet 파일을 기간(From-To)만큼 읽어 Oracle에 적재
-    특징: 전처리 로직 내장, 테이블명 및 기간 동적 변경 가능
+    특징: 전처리 로직 내장 (ORA-01722 및 DPY-3013 방지)
     """
     
-    # 템플릿 변수 적용 (DAG 실행 시 입력값으로 치환됨)
     template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table')
 
-    # [삭제됨] @apply_defaults  <-- 이것도 지워야 합니다.
     def __init__(
         self,
         oracle_conn_id,
@@ -59,18 +56,21 @@ class S3ParquetToOracleOperator(BaseOperator):
 
     def _preprocess_data(self, df):
         """
-        [전처리 로직]
-        Oracle 적재 에러(DPY-3013) 방지: 문자열 NULL -> 'N', 숫자 NULL -> 0
+        [전처리 로직 수정]
+        - STORE_AND_FWD_FLAG: 문자열(VARCHAR)이므로 NULL -> 'N'
+        - VENDOR_ID 등 ID 컬럼: 숫자형(NUMBER)이므로 NULL -> 0 (리스트에서 제거함)
         """
-        # 문자열 컬럼 정의 (필요에 따라 추가/수정 가능)
-        str_cols = ['STORE_AND_FWD_FLAG', 'VENDOR_ID', 'RATE_CODE_ID', 
-                    'PAYMENT_TYPE', 'PULOCATION_ID', 'DOLOCATION_ID']
+        
+        # ▼ [수정] 진짜 문자열 컬럼만 남깁니다. (나머지는 자동으로 0 처리됨)
+        str_cols = ['STORE_AND_FWD_FLAG']
         
         for col in str_cols:
             if col in df.columns:
+                # NULL -> 'N', 그리고 강제 문자열 변환
                 df[col] = df[col].fillna('N').astype(str).str.strip()
 
         # 나머지는 숫자형으로 가정하고 NULL -> 0 처리
+        # (VENDOR_ID, PULOCATION_ID 등이 여기서 0으로 변환되어 ORA-01722 방지)
         df = df.fillna(0)
         
         # 날짜 컬럼 변환
@@ -89,7 +89,6 @@ class S3ParquetToOracleOperator(BaseOperator):
         cursor = conn.cursor()
 
         try:
-            # 날짜 형식 처리 (YYYYMMDD or YYYY-MM-DD)
             try:
                 start_dt = pendulum.from_format(str(self.from_date), 'YYYYMMDD')
                 end_dt = pendulum.from_format(str(self.to_date), 'YYYYMMDD')
@@ -114,11 +113,9 @@ class S3ParquetToOracleOperator(BaseOperator):
                     current_dt = current_dt.add(months=1)
                     continue
 
-                # 스트리밍 로드
                 data_stream = io.BytesIO(file_obj.get()['Body'].read())
                 parquet_file = pq.ParquetFile(data_stream)
 
-                # 컬럼 매핑 및 SQL 생성
                 target_columns = [
                     'VENDOR_ID', 'TPEP_PICKUP_DATETIME', 'TPEP_DROPOFF_DATETIME', 
                     'PASSENGER_COUNT', 'TRIP_DISTANCE', 'RATE_CODE_ID', 
@@ -137,7 +134,6 @@ class S3ParquetToOracleOperator(BaseOperator):
                 for batch in parquet_file.iter_batches(batch_size=self.batch_size):
                     df_chunk = batch.to_pandas()
                     
-                    # 컬럼명 통일 (Source -> Target)
                     df_chunk = df_chunk.rename(columns={
                         'VendorID': 'VENDOR_ID', 'tpep_pickup_datetime': 'TPEP_PICKUP_DATETIME',
                         'tpep_dropoff_datetime': 'TPEP_DROPOFF_DATETIME', 'passenger_count': 'PASSENGER_COUNT',
@@ -150,14 +146,11 @@ class S3ParquetToOracleOperator(BaseOperator):
                         'congestion_surcharge': 'CONGESTION_SURCHARGE', 'airport_fee': 'AIRPORT_FEE'
                     })
                     
-                    # 없는 컬럼 채우기
                     for col in target_columns:
                         if col not in df_chunk.columns: df_chunk[col] = None
                     
-                    # 전처리 수행
                     df_chunk = self._preprocess_data(df_chunk)
                     
-                    # 데이터 튜플 변환
                     df_chunk = df_chunk[target_columns]
                     rows = [tuple(x) for x in df_chunk.to_numpy()]
                     
