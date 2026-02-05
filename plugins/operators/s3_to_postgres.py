@@ -1,6 +1,8 @@
 from airflow.models import BaseOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+# ▼ [추가] 고속 적재를 위한 라이브러리
+from psycopg2.extras import execute_values 
 import pandas as pd
 import pendulum
 import io
@@ -10,14 +12,14 @@ import gc
 class S3ParquetToPostgresOperator(BaseOperator):
     """
     [Custom Operator]
-    S3(MinIO) -> PostgreSQL 적재
+    S3(MinIO) -> PostgreSQL 고속 적재 (Batch Insert 적용)
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table')
 
     def __init__(
         self,
-        postgres_conn_id, # 변경됨
+        postgres_conn_id,
         minio_conn_id,
         target_table,
         bucket_name,
@@ -39,12 +41,10 @@ class S3ParquetToPostgresOperator(BaseOperator):
         self.batch_size = batch_size
 
     def _get_postgres_conn(self):
-        # PostgresHook을 사용하여 연결 객체 가져오기
         pg_hook = PostgresHook(postgres_conn_id=self.postgres_conn_id)
         return pg_hook.get_conn()
 
     def _preprocess_data(self, df):
-        # Postgres도 타입 에러 방지를 위해 전처리 유지
         str_cols = ['STORE_AND_FWD_FLAG', 'VENDOR_ID', 'RATE_CODE_ID', 
                     'PAYMENT_TYPE', 'PULOCATION_ID', 'DOLOCATION_ID']
         
@@ -62,7 +62,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
         return df
 
     def execute(self, context):
-        self.log.info(f"🚀 [S3ParquetToPostgresOperator] 시작: {self.from_date} ~ {self.to_date}")
+        self.log.info(f"🚀 [S3ParquetToPostgresOperator] 고속 적재 시작: {self.from_date} ~ {self.to_date}")
         
         conn = self._get_postgres_conn()
         cursor = conn.cursor()
@@ -95,7 +95,6 @@ class S3ParquetToPostgresOperator(BaseOperator):
                 data_stream = io.BytesIO(file_obj.get()['Body'].read())
                 parquet_file = pq.ParquetFile(data_stream)
 
-                # 컬럼 정의
                 target_columns = [
                     'VENDOR_ID', 'TPEP_PICKUP_DATETIME', 'TPEP_DROPOFF_DATETIME', 
                     'PASSENGER_COUNT', 'TRIP_DISTANCE', 'RATE_CODE_ID', 
@@ -105,15 +104,14 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     'TOTAL_AMOUNT', 'CONGESTION_SURCHARGE', 'AIRPORT_FEE'
                 ]
                 
-                # [핵심 변경] Postgres는 변수를 %s 로 받습니다.
-                placeholders = ', '.join(['%s'] * len(target_columns))
-                insert_sql = f"INSERT INTO {self.target_table} ({', '.join(target_columns)}) VALUES ({placeholders})"
+                # [수정] execute_values를 위한 SQL 문법
+                # "INSERT INTO table (cols) VALUES %s" <- %s 자리에 데이터 뭉치가 들어감
+                insert_sql = f"INSERT INTO {self.target_table} ({', '.join(target_columns)}) VALUES %s"
 
                 total_rows = 0
                 for batch in parquet_file.iter_batches(batch_size=self.batch_size):
                     df_chunk = batch.to_pandas()
                     
-                    # 컬럼 매핑
                     df_chunk = df_chunk.rename(columns={
                         'VendorID': 'VENDOR_ID', 'tpep_pickup_datetime': 'TPEP_PICKUP_DATETIME',
                         'tpep_dropoff_datetime': 'TPEP_DROPOFF_DATETIME', 'passenger_count': 'PASSENGER_COUNT',
@@ -130,19 +128,21 @@ class S3ParquetToPostgresOperator(BaseOperator):
                         if col not in df_chunk.columns: df_chunk[col] = None
                     
                     df_chunk = self._preprocess_data(df_chunk)
-                    
                     df_chunk = df_chunk[target_columns]
-                    # PostgresHook은 튜플 리스트를 좋아합니다
+                    
                     rows = [tuple(x) for x in df_chunk.to_numpy()]
                     
-                    cursor.executemany(insert_sql, rows)
+                    # ▼▼▼ [핵심 수정] executemany 대신 execute_values 사용 ▼▼▼
+                    # page_size: 한 번에 DB로 보내는 행의 개수 (성능에 중요)
+                    execute_values(cursor, insert_sql, rows, page_size=10000)
+                    
                     total_rows += len(rows)
                     
                     del df_chunk, rows
                     gc.collect()
 
                 conn.commit()
-                self.log.info(f"✅ {year}-{month} 처리 완료: {total_rows}건 적재됨")
+                self.log.info(f"✅ {year}-{month} 고속 처리 완료: {total_rows}건 적재됨")
                 
                 current_dt = current_dt.add(months=1)
 
