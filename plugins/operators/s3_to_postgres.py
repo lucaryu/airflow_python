@@ -1,18 +1,17 @@
 from airflow.models import BaseOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-# ▼ [추가] 고속 적재를 위한 라이브러리
-from psycopg2.extras import execute_values 
 import pandas as pd
 import pendulum
 import io
 import pyarrow.parquet as pq
 import gc
+# psycopg2.extras는 이제 필요 없습니다.
 
 class S3ParquetToPostgresOperator(BaseOperator):
     """
     [Custom Operator]
-    S3(MinIO) -> PostgreSQL 고속 적재 (Batch Insert 적용)
+    S3(MinIO) -> PostgreSQL 초고속 적재 (COPY 명령 사용)
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table')
@@ -38,7 +37,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
         self.from_date = from_date
         self.to_date = to_date
         self.key_prefix = key_prefix
-        self.batch_size = batch_size
+        self.batch_size = batch_size # COPY 방식에서는 더 늘려도 됩니다 (예: 200,000)
 
     def _get_postgres_conn(self):
         pg_hook = PostgresHook(postgres_conn_id=self.postgres_conn_id)
@@ -51,7 +50,9 @@ class S3ParquetToPostgresOperator(BaseOperator):
         for col in str_cols:
             if col in df.columns:
                 df[col] = df[col].fillna('N').astype(str).str.strip()
-
+        
+        # COPY 방식은 CSV로 변환하므로 NULL 처리를 Pandas가 알아서 하게 두는 게 낫지만,
+        # 기존 로직 유지를 위해 숫자형 NULL -> 0 변환은 유지
         df = df.fillna(0)
         
         date_cols = ['TPEP_PICKUP_DATETIME', 'TPEP_DROPOFF_DATETIME']
@@ -62,7 +63,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
         return df
 
     def execute(self, context):
-        self.log.info(f"🚀 [S3ParquetToPostgresOperator] 고속 적재 시작: {self.from_date} ~ {self.to_date}")
+        self.log.info(f"🚀 [S3ParquetToPostgresOperator] COPY 적재 시작: {self.from_date} ~ {self.to_date}")
         
         conn = self._get_postgres_conn()
         cursor = conn.cursor()
@@ -82,6 +83,13 @@ class S3ParquetToPostgresOperator(BaseOperator):
                 year = current_dt.format('YYYY')
                 month = current_dt.format('MM')
                 
+                # [추가] 멱등성을 위한 기존 데이터 삭제 (Delete)
+                next_month = current_dt.add(months=1).format('YYYY-MM-01')
+                current_month_start = current_dt.format('YYYY-MM-01')
+                delete_sql = f"DELETE FROM {self.target_table} WHERE TPEP_PICKUP_DATETIME >= '{current_month_start}' AND TPEP_PICKUP_DATETIME < '{next_month}'"
+                self.log.info(f"🧹 기존 데이터 삭제 중... ({year}-{month})")
+                cursor.execute(delete_sql)
+
                 file_key = f"{self.key_prefix}/year={year}/month={month}/yellow_tripdata_{year}-{month}.parquet"
                 self.log.info(f"📂 파일 탐색: {file_key}")
                 
@@ -103,10 +111,6 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     'TIP_AMOUNT', 'TOLLS_AMOUNT', 'IMPROVEMENT_SURCHARGE', 
                     'TOTAL_AMOUNT', 'CONGESTION_SURCHARGE', 'AIRPORT_FEE'
                 ]
-                
-                # [수정] execute_values를 위한 SQL 문법
-                # "INSERT INTO table (cols) VALUES %s" <- %s 자리에 데이터 뭉치가 들어감
-                insert_sql = f"INSERT INTO {self.target_table} ({', '.join(target_columns)}) VALUES %s"
 
                 total_rows = 0
                 for batch in parquet_file.iter_batches(batch_size=self.batch_size):
@@ -130,19 +134,26 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     df_chunk = self._preprocess_data(df_chunk)
                     df_chunk = df_chunk[target_columns]
                     
-                    rows = [tuple(x) for x in df_chunk.to_numpy()]
+                    # ▼▼▼ [핵심] 메모리 내 CSV 변환 후 COPY 명령 실행 ▼▼▼
+                    csv_buffer = io.StringIO()
+                    # index=False: 인덱스 제외, header=False: 헤더 제외, sep='\t': 탭 구분자 사용
+                    # na_rep='\\N': Postgres의 NULL 표현식으로 변환
+                    df_chunk.to_csv(csv_buffer, index=False, header=False, sep='\t', na_rep='\\N')
+                    csv_buffer.seek(0)
                     
-                    # ▼▼▼ [핵심 수정] executemany 대신 execute_values 사용 ▼▼▼
-                    # page_size: 한 번에 DB로 보내는 행의 개수 (성능에 중요)
-                    execute_values(cursor, insert_sql, rows, page_size=10000)
+                    cursor.copy_expert(
+                        f"COPY {self.target_table} ({', '.join(target_columns)}) FROM STDIN", 
+                        csv_buffer
+                    )
+                    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                     
-                    total_rows += len(rows)
+                    total_rows += len(df_chunk)
                     
-                    del df_chunk, rows
+                    del df_chunk, csv_buffer
                     gc.collect()
 
                 conn.commit()
-                self.log.info(f"✅ {year}-{month} 고속 처리 완료: {total_rows}건 적재됨")
+                self.log.info(f"✅ {year}-{month} COPY 완료: {total_rows}건 적재됨")
                 
                 current_dt = current_dt.add(months=1)
 
