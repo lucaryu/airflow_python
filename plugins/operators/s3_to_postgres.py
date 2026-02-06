@@ -6,12 +6,11 @@ import pendulum
 import io
 import pyarrow.parquet as pq
 import gc
-# psycopg2.extras는 이제 필요 없습니다.
 
 class S3ParquetToPostgresOperator(BaseOperator):
     """
     [Custom Operator]
-    S3(MinIO) -> PostgreSQL 초고속 적재 (COPY 명령 사용)
+    S3(MinIO) -> PostgreSQL 초고속 적재 (COPY 명령 사용 + 타입 에러 해결)
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table')
@@ -37,13 +36,14 @@ class S3ParquetToPostgresOperator(BaseOperator):
         self.from_date = from_date
         self.to_date = to_date
         self.key_prefix = key_prefix
-        self.batch_size = batch_size # COPY 방식에서는 더 늘려도 됩니다 (예: 200,000)
+        self.batch_size = batch_size 
 
     def _get_postgres_conn(self):
         pg_hook = PostgresHook(postgres_conn_id=self.postgres_conn_id)
         return pg_hook.get_conn()
 
     def _preprocess_data(self, df):
+        # 1. 문자열 컬럼 처리 (NULL -> 'N')
         str_cols = ['STORE_AND_FWD_FLAG', 'VENDOR_ID', 'RATE_CODE_ID', 
                     'PAYMENT_TYPE', 'PULOCATION_ID', 'DOLOCATION_ID']
         
@@ -51,10 +51,19 @@ class S3ParquetToPostgresOperator(BaseOperator):
             if col in df.columns:
                 df[col] = df[col].fillna('N').astype(str).str.strip()
         
-        # COPY 방식은 CSV로 변환하므로 NULL 처리를 Pandas가 알아서 하게 두는 게 낫지만,
-        # 기존 로직 유지를 위해 숫자형 NULL -> 0 변환은 유지
+        # 2. 기본 NULL -> 0 처리
         df = df.fillna(0)
         
+        # ▼▼▼ [핵심 수정] 정수형(Integer) 컬럼 강제 변환 (1.0 -> 1) ▼▼▼
+        # PASSENGER_COUNT가 실수(float)로 되어 있으면 COPY 명령에서 에러 발생
+        int_cols = ['PASSENGER_COUNT']
+        for col in int_cols:
+            if col in df.columns:
+                # 안전하게 0으로 채우고 int로 변환
+                df[col] = df[col].astype(int)
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+        
+        # 3. 날짜 컬럼 처리
         date_cols = ['TPEP_PICKUP_DATETIME', 'TPEP_DROPOFF_DATETIME']
         for col in date_cols:
             if col in df.columns:
@@ -83,7 +92,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
                 year = current_dt.format('YYYY')
                 month = current_dt.format('MM')
                 
-                # [추가] 멱등성을 위한 기존 데이터 삭제 (Delete)
+                # 멱등성을 위한 기존 데이터 삭제 (Delete)
                 next_month = current_dt.add(months=1).format('YYYY-MM-01')
                 current_month_start = current_dt.format('YYYY-MM-01')
                 delete_sql = f"DELETE FROM {self.target_table} WHERE TPEP_PICKUP_DATETIME >= '{current_month_start}' AND TPEP_PICKUP_DATETIME < '{next_month}'"
@@ -134,10 +143,8 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     df_chunk = self._preprocess_data(df_chunk)
                     df_chunk = df_chunk[target_columns]
                     
-                    # ▼▼▼ [핵심] 메모리 내 CSV 변환 후 COPY 명령 실행 ▼▼▼
+                    # 메모리 내 CSV 변환 후 COPY 명령 실행
                     csv_buffer = io.StringIO()
-                    # index=False: 인덱스 제외, header=False: 헤더 제외, sep='\t': 탭 구분자 사용
-                    # na_rep='\\N': Postgres의 NULL 표현식으로 변환
                     df_chunk.to_csv(csv_buffer, index=False, header=False, sep='\t', na_rep='\\N')
                     csv_buffer.seek(0)
                     
@@ -145,7 +152,6 @@ class S3ParquetToPostgresOperator(BaseOperator):
                         f"COPY {self.target_table} ({', '.join(target_columns)}) FROM STDIN", 
                         csv_buffer
                     )
-                    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                     
                     total_rows += len(df_chunk)
                     
