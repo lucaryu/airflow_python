@@ -10,7 +10,6 @@ class OracleToS3ParquetOperator(BaseOperator):
     """
     [Custom Operator]
     Oracle 데이터를 조회하여 S3(MinIO)에 Parquet 포맷으로 저장
-    경로 패턴: {key_prefix}/year=YYYY/month=MM/파일.parquet
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_table')
@@ -37,15 +36,25 @@ class OracleToS3ParquetOperator(BaseOperator):
         self.s3_key_prefix = s3_key_prefix
 
     def _get_oracle_conn(self):
+        # ▼ [수정] OracleHook은 정보만 가져오고, 연결은 oracledb.connect로 직접 수행
         oracle_hook = OracleHook(oracle_conn_id=self.oracle_conn_id)
-        # SQLAlchemy 엔진 대신 raw connection 사용 (pandas read_sql용)
-        conn = oracle_hook.get_conn()
+        conn_info = oracle_hook.get_connection(self.oracle_conn_id)
+        
+        # 서비스 이름 추출 (schema가 없으면 기본값 사용)
+        service_name = conn_info.schema if conn_info.schema else 'Oracle23ai'
+        dsn = f"{conn_info.host}:{conn_info.port}/{service_name}"
+        
+        # 직접 연결 생성 (성공했던 방식)
+        conn = oracledb.connect(
+            user=conn_info.login,
+            password=conn_info.password,
+            dsn=dsn
+        )
         return conn
 
     def execute(self, context):
         self.log.info(f"🚀 [OracleToS3] 시작: {self.from_date} ~ {self.to_date}")
         
-        # 날짜 파싱
         try:
             start_dt = pendulum.from_format(str(self.from_date), 'YYYYMMDD')
             end_dt = pendulum.from_format(str(self.to_date), 'YYYYMMDD')
@@ -55,6 +64,8 @@ class OracleToS3ParquetOperator(BaseOperator):
 
         current_dt = start_dt
         s3_hook = S3Hook(aws_conn_id=self.s3_conn_id)
+        
+        # DB 연결
         oracle_conn = self._get_oracle_conn()
 
         try:
@@ -62,10 +73,10 @@ class OracleToS3ParquetOperator(BaseOperator):
                 year = current_dt.format('YYYY')
                 month = current_dt.format('MM')
                 
-                # 월별 데이터 조회 쿼리 (TPEP_PICKUP_DATETIME 기준)
                 next_month = current_dt.add(months=1).format('YYYY-MM-01')
                 current_month_str = current_dt.format('YYYY-MM-01')
                 
+                # 날짜 필터링 조회
                 sql = f"""
                     SELECT * FROM {self.oracle_table}
                     WHERE TPEP_PICKUP_DATETIME >= TO_DATE('{current_month_str}', 'YYYY-MM-DD')
@@ -74,18 +85,17 @@ class OracleToS3ParquetOperator(BaseOperator):
                 
                 self.log.info(f"🔍 Oracle 조회 중... ({year}-{month})")
                 
-                # Pandas로 읽기
+                # Pandas로 데이터 읽기 (Chunking 없이 한 번에 읽음 - 월 단위라 괜찮음)
                 df = pd.read_sql(sql, oracle_conn)
                 
                 if df.empty:
                     self.log.warning(f"⚠️ 데이터 없음 (Skip): {year}-{month}")
                 else:
-                    # Parquet 변환 (메모리 버퍼 사용)
+                    # Parquet 변환
                     parquet_buffer = io.BytesIO()
                     df.to_parquet(parquet_buffer, index=False, engine='pyarrow')
                     parquet_buffer.seek(0)
                     
-                    # S3 업로드 경로 생성
                     s3_key = f"{self.s3_key_prefix}/year={year}/month={month}/oracle_export_{year}_{month}.parquet"
                     
                     s3_hook.load_bytes(
