@@ -13,7 +13,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
     S3(MinIO) -> PostgreSQL 초고속 적재 (COPY 명령 사용 + 타입 에러 해결)
     """
     
-    template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table')
+    template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table', 'key_prefix')
 
     def __init__(
         self,

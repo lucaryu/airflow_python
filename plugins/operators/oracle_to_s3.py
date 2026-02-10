@@ -14,7 +14,7 @@ class OracleToS3ParquetOperator(BaseOperator):
     - oracle_sql에 '{start_date}'가 없으면 -> 전체 통적재 (Full Load)
     """
     
-    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql')
+    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql', 's3_key_prefix')
 
     def __init__(
         self,
