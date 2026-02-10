@@ -9,23 +9,21 @@ import oracledb
 class OracleToS3ParquetOperator(BaseOperator):
     """
     [Universal Custom Operator]
-    - oracle_sql: 실행할 쿼리 (FROM 절에 들어갈 내용)
-    - date_column: 
-        - 값 있음: 해당 컬럼 기준으로 월별 분할 조회 (Incremental Load)
-        - None/Empty: 조건 없이 전체 조회 (Full Load)
+    Oracle SQL 결과를 S3에 Parquet로 저장
+    - oracle_sql에 '{start_date}'가 포함되면 -> 월별 분할 적재 (Incremental)
+    - oracle_sql에 '{start_date}'가 없으면 -> 전체 통적재 (Full Load)
     """
     
-    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql', 'date_column')
+    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql')
 
     def __init__(
         self,
         oracle_conn_id,
         s3_conn_id,
-        oracle_sql,
+        oracle_sql,       # 전체 SQL (날짜 변수 포함 가능)
         bucket_name,
         from_date,
         to_date,
-        date_column=None, # 이 값이 None이면 Full Load 모드로 동작
         s3_key_prefix='taxi',
         *args,
         **kwargs
@@ -34,7 +32,7 @@ class OracleToS3ParquetOperator(BaseOperator):
         self.oracle_conn_id = oracle_conn_id
         self.s3_conn_id = s3_conn_id
         self.oracle_sql = oracle_sql
-        self.date_column = date_column
+        # date_column 파라미터는 삭제했습니다. (SQL 문자열 파싱으로 대체)
         self.bucket_name = bucket_name
         self.from_date = from_date
         self.to_date = to_date
@@ -62,43 +60,43 @@ class OracleToS3ParquetOperator(BaseOperator):
 
         try:
             # ---------------------------------------------------------
-            # CASE 1: 분할 적재 (date_column이 있는 경우)
+            # CASE 1: SQL 내부에 날짜 변수가 있는 경우 (분할 적재)
             # ---------------------------------------------------------
-            if self.date_column and self.date_column.lower() != 'none' and self.date_column.strip() != '':
-                self.log.info(f"🔄 모드: 월별 분할 적재 (기준 컬럼: {self.date_column})")
+            if "{start_date}" in self.oracle_sql:
+                self.log.info("🔄 모드: 월별 분할 적재 (SQL 내 날짜 변수 감지됨)")
                 
                 current_dt = start_dt
                 while current_dt <= end_dt:
                     year = current_dt.format('YYYY')
                     month = current_dt.format('MM')
                     
-                    next_month = current_dt.add(months=1).format('YYYY-MM-01')
+                    # 날짜 변수 계산
                     current_month_str = current_dt.format('YYYY-MM-01')
+                    next_month_str = current_dt.add(months=1).format('YYYY-MM-01')
                     
-                    # 사용자가 작성한 쿼리를 서브쿼리로 감싸고 날짜 조건을 붙임
-                    sql = f"""
-                        SELECT * FROM ({self.oracle_sql}) 
-                        WHERE {self.date_column} >= TO_DATE('{current_month_str}', 'YYYY-MM-DD')
-                          AND {self.date_column} < TO_DATE('{next_month}', 'YYYY-MM-DD')
-                    """
+                    # ▼ 사용자가 작성한 SQL에 날짜만 채워 넣음 (.format 사용)
+                    final_sql = self.oracle_sql.format(
+                        start_date=current_month_str,
+                        end_date=next_month_str
+                    )
                     
-                    self._process_and_upload(oracle_conn, s3_hook, sql, year, month)
+                    self._process_and_upload(oracle_conn, s3_hook, final_sql, year, month)
                     current_dt = current_dt.add(months=1)
 
             # ---------------------------------------------------------
-            # CASE 2: 전체 적재 (date_column이 없는 경우)
+            # CASE 2: SQL 내부에 날짜 변수가 없는 경우 (전체 적재)
             # ---------------------------------------------------------
             else:
-                self.log.info("📦 모드: 전체 통적재 (Full Load)")
+                self.log.info("📦 모드: 전체 통적재 (SQL 내 날짜 변수 없음)")
                 
-                # 조건 없이 그대로 실행
-                sql = f"SELECT * FROM ({self.oracle_sql})"
+                # 변환 없이 그대로 실행 (SELECT * FROM 감싸지 않음!)
+                final_sql = self.oracle_sql
                 
-                # 저장 위치는 시작일의 연/월 폴더 사용
+                # 저장 위치는 시작일 기준 연/월 사용
                 year = start_dt.format('YYYY')
                 month = start_dt.format('MM')
                 
-                self._process_and_upload(oracle_conn, s3_hook, sql, year, month)
+                self._process_and_upload(oracle_conn, s3_hook, final_sql, year, month)
 
         finally:
             if oracle_conn:
@@ -106,6 +104,8 @@ class OracleToS3ParquetOperator(BaseOperator):
 
     def _process_and_upload(self, conn, s3_hook, sql, year, month):
         self.log.info(f"🔍 조회 실행: {year}-{month}")
+        self.log.debug(f"SQL: {sql}")
+        
         df = pd.read_sql(sql, conn)
         
         if df.empty:
