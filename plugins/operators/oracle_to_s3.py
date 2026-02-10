@@ -10,19 +10,16 @@ class OracleToS3ParquetOperator(BaseOperator):
     """
     [Custom Operator]
     Oracle에서 SQL 결과(SELECT)를 조회하여 S3에 Parquet로 저장
-    - oracle_sql: 실행할 기본 조회 쿼리 (예: SELECT * FROM TAXI_DATA)
-    - date_column: 기간별 분할 기준이 되는 날짜 컬럼명 (예: TPEP_PICKUP_DATETIME)
+    - oracle_sql: 실행할 전체 SQL (단, 날짜 부분은 {start_date}, {end_date} 로 작성해야 함)
     """
     
-    # 템플릿 변수 허용 (SQL 내부에 {{ ds }} 등을 쓸 수 있음)
-    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql', 'date_column')
+    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql')
 
     def __init__(
         self,
         oracle_conn_id,
         s3_conn_id,
-        oracle_sql,       # [변경] 테이블명 대신 SQL을 받음
-        date_column,      # [추가] 날짜 기준 컬럼명
+        oracle_sql,       # 전체 SQL을 받음
         bucket_name,
         from_date,
         to_date,
@@ -34,7 +31,7 @@ class OracleToS3ParquetOperator(BaseOperator):
         self.oracle_conn_id = oracle_conn_id
         self.s3_conn_id = s3_conn_id
         self.oracle_sql = oracle_sql
-        self.date_column = date_column
+        # date_column 삭제됨 (SQL에 직접 작성하므로 불필요)
         self.bucket_name = bucket_name
         self.from_date = from_date
         self.to_date = to_date
@@ -73,18 +70,21 @@ class OracleToS3ParquetOperator(BaseOperator):
                 year = current_dt.format('YYYY')
                 month = current_dt.format('MM')
                 
-                next_month = current_dt.add(months=1).format('YYYY-MM-01')
+                # 날짜 문자열 계산
                 current_month_str = current_dt.format('YYYY-MM-01')
+                next_month_str = current_dt.add(months=1).format('YYYY-MM-01')
                 
-                # ▼▼▼ [핵심 변경] 입력받은 SQL을 서브쿼리로 감싸고 날짜 조건 추가 ▼▼▼
-                # 이렇게 하면 사용자가 "SELECT A, B FROM TABLE" 이라고만 입력해도
-                # 자동으로 날짜 필터링이 붙습니다.
-                sql = f"""
-                    SELECT * FROM ({self.oracle_sql}) 
-                    WHERE {self.date_column} >= TO_DATE('{current_month_str}', 'YYYY-MM-DD')
-                      AND {self.date_column} < TO_DATE('{next_month}', 'YYYY-MM-DD')
-                """
-                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+                # ▼▼▼ [핵심 변경] 사용자가 준 SQL에 날짜 변수만 매핑 ▼▼▼
+                # 사용자가 SQL에 {start_date}와 {end_date}를 적어두면 여기서 치환됩니다.
+                try:
+                    sql = self.oracle_sql.format(
+                        start_date=current_month_str,
+                        end_date=next_month_str
+                    )
+                except KeyError as e:
+                    self.log.error("❌ SQL에 {start_date} 또는 {end_date} 포맷 문자열이 없습니다!")
+                    raise e
+                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                 
                 self.log.info(f"🔍 Oracle 조회 실행 ({year}-{month})")
                 self.log.debug(f"실행 SQL: {sql}")
@@ -98,7 +98,6 @@ class OracleToS3ParquetOperator(BaseOperator):
                     df.to_parquet(parquet_buffer, index=False, engine='pyarrow')
                     parquet_buffer.seek(0)
                     
-                    # Postgres 적재 호환성을 위해 yellow_tripdata 이름 유지
                     filename = f"yellow_tripdata_{year}-{month}.parquet"
                     s3_key = f"{self.s3_key_prefix}/year={year}/month={month}/{filename}"
                     

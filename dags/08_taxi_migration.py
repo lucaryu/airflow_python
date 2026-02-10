@@ -6,36 +6,17 @@ import pendulum
 from datetime import timedelta
 
 # ---------------------------------------------------------
-# 1. 개발자가 수정하는 영역 (SQL 정의)
+# 1. 개발자가 작성하는 전체 SQL (WHERE 절 포함)
 # ---------------------------------------------------------
-# Oracle에서 조회할 쿼리를 여기에 직접 작성하세요.
-# 주의: 마지막에 WHERE 절로 날짜 필터링이 자동으로 붙으므로, ; (세미콜론)을 쓰지 마세요.
+# 주의: 날짜 부분은 Operator가 채워주므로 {start_date}, {end_date} 로 적어야 합니다.
+# TO_DATE 함수 안의 형식을 꼭 맞춰주세요.
 SOURCE_SQL = """
     SELECT 
-        VENDOR_ID,
-        TPEP_PICKUP_DATETIME,
-        TPEP_DROPOFF_DATETIME,
-        PASSENGER_COUNT,
-        TRIP_DISTANCE,
-        RATE_CODE_ID,
-        STORE_AND_FWD_FLAG,
-        PULOCATION_ID,
-        DOLOCATION_ID,
-        PAYMENT_TYPE,
-        FARE_AMOUNT,
-        EXTRA,
-        MTA_TAX,
-        TIP_AMOUNT,
-        TOLLS_AMOUNT,
-        IMPROVEMENT_SURCHARGE,
-        TOTAL_AMOUNT,
-        CONGESTION_SURCHARGE,
-        AIRPORT_FEE
+        *
     FROM TAXI_DATA
+    WHERE TPEP_PICKUP_DATETIME >= TO_DATE('{start_date}', 'YYYY-MM-DD')
+      AND TPEP_PICKUP_DATETIME <  TO_DATE('{end_date}',   'YYYY-MM-DD')
 """
-
-# 기간 조회의 기준이 될 Oracle 컬럼명
-DATE_COLUMN = "TPEP_PICKUP_DATETIME"
 
 # ---------------------------------------------------------
 # 2. DAG 설정
@@ -47,7 +28,6 @@ default_args = {
     'execution_timeout': timedelta(hours=5)
 }
 
-# UI에서는 날짜와 타겟 테이블 이름만 입력받음
 params = {
     "from_date": Param("20230101", type="string", description="시작일 (YYYYMMDD)"),
     "to_date": Param("20230331", type="string", description="종료일 (YYYYMMDD)"),
@@ -59,26 +39,25 @@ with DAG(
     default_args=default_args,
     schedule=None,
     params=params,
-    tags=['portfolio', 'oracle', 's3', 'postgres', 'code_based_sql'],
+    tags=['portfolio', 'oracle', 's3', 'postgres', 'full_sql_control'],
 ) as dag:
 
-    # 1. Oracle -> S3 (Extract)
+    # 1. Oracle -> S3 (전체 SQL 전달)
     extract_task = OracleToS3ParquetOperator(
         task_id='extract_oracle_to_s3',
         oracle_conn_id='oracle_conn',
         s3_conn_id='minio_conn',
         bucket_name='bronze',
         
-        # ▼▼▼ [핵심] 개발자가 위에 정의한 변수를 직접 사용 ▼▼▼
+        # ▼▼▼ 전체 SQL을 그대로 넘깁니다. (date_column 파라미터 삭제됨) ▼▼▼
         oracle_sql=SOURCE_SQL,
-        date_column=DATE_COLUMN,
         
         from_date='{{ params.from_date }}',
         to_date='{{ params.to_date }}',
         s3_key_prefix='taxi_migration'
     )
 
-    # 2. S3 -> Postgres (Load)
+    # 2. S3 -> Postgres (고속 적재)
     load_task = S3ParquetToPostgresOperator(
         task_id='load_s3_to_postgres',
         postgres_conn_id='postgres_default',
