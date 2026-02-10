@@ -9,17 +9,20 @@ import oracledb
 class OracleToS3ParquetOperator(BaseOperator):
     """
     [Custom Operator]
-    Oracle 데이터를 조회하여 S3(MinIO)에 Parquet 포맷으로 저장
-    파일명 형식: yellow_tripdata_YYYY-MM.parquet (Postgres 적재 호환용)
+    Oracle에서 SQL 결과(SELECT)를 조회하여 S3에 Parquet로 저장
+    - oracle_sql: 실행할 기본 조회 쿼리 (예: SELECT * FROM TAXI_DATA)
+    - date_column: 기간별 분할 기준이 되는 날짜 컬럼명 (예: TPEP_PICKUP_DATETIME)
     """
     
-    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_table')
+    # 템플릿 변수 허용 (SQL 내부에 {{ ds }} 등을 쓸 수 있음)
+    template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql', 'date_column')
 
     def __init__(
         self,
         oracle_conn_id,
         s3_conn_id,
-        oracle_table,
+        oracle_sql,       # [변경] 테이블명 대신 SQL을 받음
+        date_column,      # [추가] 날짜 기준 컬럼명
         bucket_name,
         from_date,
         to_date,
@@ -30,21 +33,20 @@ class OracleToS3ParquetOperator(BaseOperator):
         super().__init__(*args, **kwargs)
         self.oracle_conn_id = oracle_conn_id
         self.s3_conn_id = s3_conn_id
-        self.oracle_table = oracle_table
+        self.oracle_sql = oracle_sql
+        self.date_column = date_column
         self.bucket_name = bucket_name
         self.from_date = from_date
         self.to_date = to_date
         self.s3_key_prefix = s3_key_prefix
 
     def _get_oracle_conn(self):
-        # OracleHook은 연결 정보 조회용으로만 사용 (Wallet 에러 방지)
         oracle_hook = OracleHook(oracle_conn_id=self.oracle_conn_id)
         conn_info = oracle_hook.get_connection(self.oracle_conn_id)
         
         service_name = conn_info.schema if conn_info.schema else 'Oracle23ai'
         dsn = f"{conn_info.host}:{conn_info.port}/{service_name}"
         
-        # oracledb로 직접 연결
         conn = oracledb.connect(
             user=conn_info.login,
             password=conn_info.password,
@@ -64,8 +66,6 @@ class OracleToS3ParquetOperator(BaseOperator):
 
         current_dt = start_dt
         s3_hook = S3Hook(aws_conn_id=self.s3_conn_id)
-        
-        # DB 연결
         oracle_conn = self._get_oracle_conn()
 
         try:
@@ -76,30 +76,31 @@ class OracleToS3ParquetOperator(BaseOperator):
                 next_month = current_dt.add(months=1).format('YYYY-MM-01')
                 current_month_str = current_dt.format('YYYY-MM-01')
                 
-                # 날짜 필터링 조회 SQL
+                # ▼▼▼ [핵심 변경] 입력받은 SQL을 서브쿼리로 감싸고 날짜 조건 추가 ▼▼▼
+                # 이렇게 하면 사용자가 "SELECT A, B FROM TABLE" 이라고만 입력해도
+                # 자동으로 날짜 필터링이 붙습니다.
                 sql = f"""
-                    SELECT * FROM {self.oracle_table}
-                    WHERE TPEP_PICKUP_DATETIME >= TO_DATE('{current_month_str}', 'YYYY-MM-DD')
-                      AND TPEP_PICKUP_DATETIME < TO_DATE('{next_month}', 'YYYY-MM-DD')
+                    SELECT * FROM ({self.oracle_sql}) 
+                    WHERE {self.date_column} >= TO_DATE('{current_month_str}', 'YYYY-MM-DD')
+                      AND {self.date_column} < TO_DATE('{next_month}', 'YYYY-MM-DD')
                 """
+                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                 
-                self.log.info(f"🔍 Oracle 조회 중... ({year}-{month})")
+                self.log.info(f"🔍 Oracle 조회 실행 ({year}-{month})")
+                self.log.debug(f"실행 SQL: {sql}")
                 
-                # Pandas로 데이터 읽기
                 df = pd.read_sql(sql, oracle_conn)
                 
                 if df.empty:
                     self.log.warning(f"⚠️ 데이터 없음 (Skip): {year}-{month}")
                 else:
-                    # Parquet 변환 (메모리 버퍼)
                     parquet_buffer = io.BytesIO()
                     df.to_parquet(parquet_buffer, index=False, engine='pyarrow')
                     parquet_buffer.seek(0)
                     
-                    # ▼▼▼ [수정] 파일명을 yellow_tripdata_YYYY-MM.parquet 로 통일 ▼▼▼
+                    # Postgres 적재 호환성을 위해 yellow_tripdata 이름 유지
                     filename = f"yellow_tripdata_{year}-{month}.parquet"
                     s3_key = f"{self.s3_key_prefix}/year={year}/month={month}/{filename}"
-                    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                     
                     s3_hook.load_bytes(
                         bytes_data=parquet_buffer.getvalue(),
