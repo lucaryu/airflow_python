@@ -8,10 +8,11 @@ import oracledb
 
 class OracleToS3ParquetOperator(BaseOperator):
     """
-    [万能 Custom Operator]
-    Oracle -> S3 Parquet 저장
-    - date_column이 있으면: 월별 분할 적재 (Incremental)
-    - date_column이 없으면: 한 번에 전체 적재 (Full Load)
+    [Universal Custom Operator]
+    - oracle_sql: 실행할 쿼리 (FROM 절에 들어갈 내용)
+    - date_column: 
+        - 값 있음: 해당 컬럼 기준으로 월별 분할 조회 (Incremental Load)
+        - None/Empty: 조건 없이 전체 조회 (Full Load)
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'oracle_sql', 'date_column')
@@ -20,11 +21,11 @@ class OracleToS3ParquetOperator(BaseOperator):
         self,
         oracle_conn_id,
         s3_conn_id,
-        oracle_sql,       # 실행할 SQL (테이블명 또는 쿼리)
+        oracle_sql,
         bucket_name,
         from_date,
         to_date,
-        date_column=None, # [선택] 없으면 Full Load
+        date_column=None, # 이 값이 None이면 Full Load 모드로 동작
         s3_key_prefix='taxi',
         *args,
         **kwargs
@@ -33,10 +34,10 @@ class OracleToS3ParquetOperator(BaseOperator):
         self.oracle_conn_id = oracle_conn_id
         self.s3_conn_id = s3_conn_id
         self.oracle_sql = oracle_sql
+        self.date_column = date_column
         self.bucket_name = bucket_name
         self.from_date = from_date
         self.to_date = to_date
-        self.date_column = date_column # None이면 전체 적재
         self.s3_key_prefix = s3_key_prefix
 
     def _get_oracle_conn(self):
@@ -49,7 +50,6 @@ class OracleToS3ParquetOperator(BaseOperator):
     def execute(self, context):
         self.log.info(f"🚀 [OracleToS3] 시작: {self.from_date} ~ {self.to_date}")
         
-        # 날짜 파싱
         try:
             start_dt = pendulum.from_format(str(self.from_date), 'YYYYMMDD')
             end_dt = pendulum.from_format(str(self.to_date), 'YYYYMMDD')
@@ -62,7 +62,7 @@ class OracleToS3ParquetOperator(BaseOperator):
 
         try:
             # ---------------------------------------------------------
-            # CASE 1: 날짜 컬럼이 있는 경우 (월별 반복 적재)
+            # CASE 1: 분할 적재 (date_column이 있는 경우)
             # ---------------------------------------------------------
             if self.date_column and self.date_column.lower() != 'none' and self.date_column.strip() != '':
                 self.log.info(f"🔄 모드: 월별 분할 적재 (기준 컬럼: {self.date_column})")
@@ -72,10 +72,10 @@ class OracleToS3ParquetOperator(BaseOperator):
                     year = current_dt.format('YYYY')
                     month = current_dt.format('MM')
                     
-                    # 날짜 조건 생성
                     next_month = current_dt.add(months=1).format('YYYY-MM-01')
                     current_month_str = current_dt.format('YYYY-MM-01')
                     
+                    # 사용자가 작성한 쿼리를 서브쿼리로 감싸고 날짜 조건을 붙임
                     sql = f"""
                         SELECT * FROM ({self.oracle_sql}) 
                         WHERE {self.date_column} >= TO_DATE('{current_month_str}', 'YYYY-MM-DD')
@@ -86,15 +86,15 @@ class OracleToS3ParquetOperator(BaseOperator):
                     current_dt = current_dt.add(months=1)
 
             # ---------------------------------------------------------
-            # CASE 2: 날짜 컬럼이 없는 경우 (Full Load - 한 번만 실행)
+            # CASE 2: 전체 적재 (date_column이 없는 경우)
             # ---------------------------------------------------------
             else:
                 self.log.info("📦 모드: 전체 통적재 (Full Load)")
                 
-                # Full Load는 날짜 조건 없이 원본 SQL 그대로 실행
+                # 조건 없이 그대로 실행
                 sql = f"SELECT * FROM ({self.oracle_sql})"
                 
-                # 저장 위치는 편의상 from_date의 연/월 폴더에 저장 (Loader가 찾기 쉽게)
+                # 저장 위치는 시작일의 연/월 폴더 사용
                 year = start_dt.format('YYYY')
                 month = start_dt.format('MM')
                 
@@ -105,7 +105,6 @@ class OracleToS3ParquetOperator(BaseOperator):
                 oracle_conn.close()
 
     def _process_and_upload(self, conn, s3_hook, sql, year, month):
-        """데이터 조회 및 S3 업로드 공통 함수"""
         self.log.info(f"🔍 조회 실행: {year}-{month}")
         df = pd.read_sql(sql, conn)
         
@@ -117,7 +116,6 @@ class OracleToS3ParquetOperator(BaseOperator):
         df.to_parquet(parquet_buffer, index=False, engine='pyarrow')
         parquet_buffer.seek(0)
         
-        # 파일명 통일 (Loader 호환성 유지)
         filename = f"yellow_tripdata_{year}-{month}.parquet"
         s3_key = f"{self.s3_key_prefix}/year={year}/month={month}/{filename}"
         
