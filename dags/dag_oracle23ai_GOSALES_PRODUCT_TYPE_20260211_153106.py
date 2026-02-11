@@ -79,6 +79,5 @@ with DAG(
         
         batch_size=100000
     )
-    )
 
     extract_task >> load_task
