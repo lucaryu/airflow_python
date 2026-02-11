@@ -11,10 +11,10 @@ class S3ParquetToPostgresOperator(BaseOperator):
     """
     [Smart Loader Operator]
     S3 -> Postgres 적재
-    1. from_date/to_date가 없으면 (Full Load):
+    1. from_date/to_date가 없거나 'None'이면 (Full Load):
        - 테이블 TRUNCATE (전체 삭제)
        - S3 폴더 내 모든 Parquet 파일 적재
-    2. from_date/to_date가 있으면 (Incremental Load):
+    2. from_date/to_date가 유효하면 (Incremental Load):
        - date_column이 있으면 해당 기간 데이터 DELETE (부분 삭제)
        - 해당 기간의 S3 파일만 적재
     """
@@ -70,16 +70,17 @@ class S3ParquetToPostgresOperator(BaseOperator):
         s3_hook = S3Hook(aws_conn_id=self.minio_conn_id)
 
         try:
-            # ✅ 날짜 파라미터 유무 확인
-            # Airflow param이 비어있으면 None 또는 빈 문자열('')로 들어옴
-            has_date = (self.from_date and str(self.from_date).strip()) and \
-                       (self.to_date and str(self.to_date).strip())
+            # ✅ [수정] 날짜 파라미터 유무 확인 (문자열 'None'도 빈 값으로 처리)
+            def is_valid_date(d):
+                return d and str(d).strip().lower() not in ['none', '', 'null']
+
+            has_date = is_valid_date(self.from_date) and is_valid_date(self.to_date)
 
             # =========================================================
             # CASE 1: Full Load (날짜 없음 -> TRUNCATE -> 모든 파일)
             # =========================================================
             if not has_date:
-                self.log.info(f"📦 [Full Load] 날짜 범위 없음 -> 테이블({self.target_table}) TRUNCATE 실행")
+                self.log.info(f"📦 [Full Load] 날짜 범위 없음(None) -> 테이블({self.target_table}) TRUNCATE 실행")
                 cursor.execute(f"TRUNCATE TABLE {self.target_table}")
                 conn.commit()
 
@@ -118,7 +119,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     month = current_dt.format('MM')
                     
                     # 1. 기존 데이터 삭제 (date_column이 있을 때만)
-                    if self.date_column:
+                    if self.date_column and str(self.date_column).lower() != 'none':
                         next_month = current_dt.add(months=1).format('YYYY-MM-01')
                         current_month_start = current_dt.format('YYYY-MM-01')
                         
@@ -132,7 +133,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     else:
                         self.log.info(f"ℹ️ date_column 없음 -> 삭제 건너뜀 ({year}-{month})")
 
-                    # 2. 해당 월 파일 적재
+                    # 2. 해당 월 파일 적재 (OracleToS3와 파일명 규칙 동일하게)
                     filename = f"yellow_tripdata_{year}-{month}.parquet"
                     file_key = f"{self.key_prefix}/year={year}/month={month}/{filename}"
                     
