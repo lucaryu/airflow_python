@@ -68,16 +68,17 @@ with DAG(
         minio_conn_id='minio_conn',
         bucket_name='bronze',
         
-        # ▼▼▼ 입력받은 테이블 이름 사용
         target_table='{{ params.target_table }}',
-        
         from_date='{{ params.from_date }}',
         to_date='{{ params.to_date }}',
-        
-        # ▼▼▼ 위에서 저장한 폴더명과 똑같이 설정
         key_prefix='{{ params.target_table | lower }}',
         
+        # ▼▼▼ [추가] 중요! Extract 단계에서 썼던 변수를 여기서도 넘겨줘야 합니다 ▼▼▼
+        # DATE_COLUMN 변수가 None이면 Full Load(Truncate) 모드로 동작합니다.
+        date_column=DATE_COLUMN, 
+        
         batch_size=100000
+    )
     )
 
     extract_task >> load_task
