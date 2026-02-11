@@ -6,11 +6,10 @@ import pendulum
 from datetime import timedelta
 
 # =========================================================
-# 📝 [개발자 영역] SQL 작성
+# 📝 [개발자 영역] 설정
 # =========================================================
-# 여기에 실행할 쿼리를 작성하세요.
-# - 분할 적재: {start_date}, {end_date} 포함 필수
-# - 전체 적재: 날짜 변수 없이 작성
+
+# 1. Oracle 조회 쿼리 (날짜 변수 없음 -> 전체 조회)
 SOURCE_SQL = """
     SELECT PRODUCT_TYPE_CODE
      , PRODUCT_LINE_CODE
@@ -18,6 +17,15 @@ SOURCE_SQL = """
      , SYSDATE
   FROM GOSALES.PRODUCT_TYPE
 """
+
+# 2. 적재 테이블 이름
+TARGET_TABLE = "product_type"
+
+# 3. 날짜 기준 컬럼
+# - 값이 있으면 (예: 'REG_DATE'): 기간별 DELETE 후 적재
+# - 값이 없으면 (None): 전체 TRUNCATE 후 적재 (단, 날짜 파라미터가 없어야 함)
+DATE_COLUMN = None  # 마스터 테이블이므로 None
+
 # =========================================================
 
 default_args = {
@@ -27,13 +35,11 @@ default_args = {
     'execution_timeout': timedelta(hours=5)
 }
 
-# UI 파라미터 설정
+# UI 파라미터 설정 (날짜를 비울 수 있게 type에 null 추가)
 params = {
-    "from_date": Param("20230101", type="string", description="시작일 (YYYYMMDD)"),
-    "to_date": Param("20230331", type="string", description="종료일 (YYYYMMDD)"),
-    
-    # ▼▼▼ 여기서 테이블 이름을 입력받습니다. ▼▼▼
-    "target_table": Param("product_type", type="string", description="Postgres 적재 테이블명 (S3 폴더명으로도 사용됨)")
+    "from_date": Param(None, type=["string", "null"], description="시작일 (비우면 Full Load)"),
+    "to_date": Param(None, type=["string", "null"], description="종료일 (비우면 Full Load)"),
+    "target_table": Param(TARGET_TABLE, type="string", description="Postgres 적재 테이블명")
 }
 
 with DAG(
@@ -51,13 +57,10 @@ with DAG(
         s3_conn_id='minio_conn',
         bucket_name='bronze',
         
-        # 개발자가 작성한 SQL 사용
         oracle_sql=SOURCE_SQL,
         
         from_date='{{ params.from_date }}',
         to_date='{{ params.to_date }}',
-        
-        # ▼▼▼ 입력받은 테이블 이름을 소문자로 바꿔서 폴더명으로 사용 (예: TAXI_DATA -> taxi_data)
         s3_key_prefix='{{ params.target_table | lower }}'
     )
 
@@ -73,9 +76,8 @@ with DAG(
         to_date='{{ params.to_date }}',
         key_prefix='{{ params.target_table | lower }}',
         
-        # ▼▼▼ [추가] 중요! Extract 단계에서 썼던 변수를 여기서도 넘겨줘야 합니다 ▼▼▼
-        # DATE_COLUMN 변수가 None이면 Full Load(Truncate) 모드로 동작합니다.
-        date_column=DATE_COLUMN, 
+        # ▼ 상단에서 정의한 변수를 넘겨줍니다.
+        date_column=DATE_COLUMN,
         
         batch_size=100000
     )
