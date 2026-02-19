@@ -11,12 +11,8 @@ class S3ParquetToPostgresOperator(BaseOperator):
     """
     [Smart Loader Operator]
     S3 -> Postgres 적재
-    1. from_date/to_date가 없거나 'None'이면 (Full Load):
-       - 테이블 TRUNCATE (전체 삭제)
-       - S3 폴더 내 모든 Parquet 파일 적재
-    2. from_date/to_date가 유효하면 (Incremental Load):
-       - date_column이 있으면 해당 기간 데이터 DELETE (부분 삭제)
-       - 해당 기간의 S3 파일만 적재
+    - 날짜 컬럼 자동 감지 강화 (DATE, TIME, SINCE, DT 등)
+    - NULL 처리 개선: 숫자는 0, 문자는 'N', 날짜는 NULL 유지
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table', 'key_prefix', 'date_column')
@@ -51,17 +47,31 @@ class S3ParquetToPostgresOperator(BaseOperator):
         return pg_hook.get_conn()
 
     def _preprocess_data(self, df):
-        # 1. 문자열 컬럼 처리 (NULL -> 'N', 공백 제거)
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].fillna('N').astype(str).str.strip()
+        """데이터 타입별 NULL 처리 및 형변환 (매우 중요!)"""
         
-        # 2. 숫자형 NULL 처리 (0으로 채움)
-        df = df.fillna(0)
+        # 1. 날짜 컬럼 강제 변환 (NULL 유지를 위해 가장 먼저 수행)
+        # 컬럼명에 아래 키워드가 있으면 날짜로 인식 (euro_in_use_since 대응을 위해 'SINCE' 추가)
+        date_keywords = ['DATE', 'TIME', 'SINCE', 'DT', 'TIMESTAMP', 'DAY']
         
-        # 3. 날짜 컬럼 자동 감지 및 변환
         for col in df.columns:
-            if 'TIME' in col.upper() or 'DATE' in col.upper():
-                 df[col] = pd.to_datetime(df[col], errors='coerce')
+            if any(k in col.upper() for k in date_keywords):
+                # errors='coerce'는 변환 실패(NULL 포함) 시 NaT(Not a Time)로 설정 -> DB에는 NULL로 들어감
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+
+        # 2. 숫자형 컬럼만 NULL -> 0 변환
+        # (날짜 컬럼은 이미 datetime 타입이 되었으므로 여기서 제외됨)
+        num_cols = df.select_dtypes(include=['number']).columns
+        df[num_cols] = df[num_cols].fillna(0)
+        
+        # 3. 문자열 컬럼 처리 (NULL -> 빈 문자열 또는 'N')
+        # object 타입 중 datetime이 아닌 것들
+        obj_cols = df.select_dtypes(include=['object']).columns
+        for col in obj_cols:
+            df[col] = df[col].fillna('\\N').astype(str).str.strip()
+            # 주의: Postgres COPY에서 \N은 NULL을 의미함. 
+            # 빈값으로 넣고 싶으면 '' 로 설정. 여기서는 원본 데이터 보존을 위해 \N(NULL) 사용 권장.
+            # 만약 'N' 문자로 채우고 싶다면 fillna('N') 사용.
+        
         return df
 
     def execute(self, context):
@@ -70,25 +80,21 @@ class S3ParquetToPostgresOperator(BaseOperator):
         s3_hook = S3Hook(aws_conn_id=self.minio_conn_id)
 
         try:
-            # ✅ [수정] 날짜 파라미터 유무 확인 (문자열 'None'도 빈 값으로 처리)
             def is_valid_date(d):
                 return d and str(d).strip().lower() not in ['none', '', 'null']
 
             has_date = is_valid_date(self.from_date) and is_valid_date(self.to_date)
 
             # =========================================================
-            # CASE 1: Full Load (날짜 없음 -> TRUNCATE -> 모든 파일)
+            # CASE 1: Full Load
             # =========================================================
             if not has_date:
-                self.log.info(f"📦 [Full Load] 날짜 범위 없음(None) -> 테이블({self.target_table}) TRUNCATE 실행")
+                self.log.info(f"📦 [Full Load] 날짜 범위 없음 -> 테이블({self.target_table}) TRUNCATE 실행")
                 cursor.execute(f"TRUNCATE TABLE {self.target_table}")
                 conn.commit()
 
-                # S3 해당 폴더(prefix) 밑의 모든 파일 조회
                 self.log.info(f"📂 S3 전체 스캔 중: {self.key_prefix}/")
                 all_objs = s3_hook.list_keys(bucket_name=self.bucket_name, prefix=self.key_prefix)
-                
-                # .parquet 파일만 필터링
                 target_files = [f for f in all_objs if f.endswith('.parquet')] if all_objs else []
                 
                 if not target_files:
@@ -100,12 +106,10 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     self._load_single_file(s3_hook, cursor, file_key, conn)
 
             # =========================================================
-            # CASE 2: Incremental Load (날짜 있음 -> DELETE -> 기간 파일)
+            # CASE 2: Incremental Load
             # =========================================================
             else:
                 self.log.info(f"🔄 [Incremental Load] 기간: {self.from_date} ~ {self.to_date}")
-                
-                # 날짜 파싱
                 try:
                     start_dt = pendulum.from_format(str(self.from_date), 'YYYYMMDD')
                     end_dt = pendulum.from_format(str(self.to_date), 'YYYYMMDD')
@@ -118,7 +122,6 @@ class S3ParquetToPostgresOperator(BaseOperator):
                     year = current_dt.format('YYYY')
                     month = current_dt.format('MM')
                     
-                    # 1. 기존 데이터 삭제 (date_column이 있을 때만)
                     if self.date_column and str(self.date_column).lower() != 'none':
                         next_month = current_dt.add(months=1).format('YYYY-MM-01')
                         current_month_start = current_dt.format('YYYY-MM-01')
@@ -130,10 +133,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
                         """
                         self.log.info(f"🧹 기간 삭제 실행 ({year}-{month})")
                         cursor.execute(delete_sql)
-                    else:
-                        self.log.info(f"ℹ️ date_column 없음 -> 삭제 건너뜀 ({year}-{month})")
 
-                    # 2. 해당 월 파일 적재 (OracleToS3와 파일명 규칙 동일하게)
                     filename = f"yellow_tripdata_{year}-{month}.parquet"
                     file_key = f"{self.key_prefix}/year={year}/month={month}/{filename}"
                     
@@ -153,7 +153,6 @@ class S3ParquetToPostgresOperator(BaseOperator):
             conn.close()
 
     def _load_single_file(self, s3_hook, cursor, file_key, conn):
-        """파일 하나를 COPY 명령어로 적재하는 내부 함수"""
         self.log.info(f"📥 적재 시작: {file_key}")
         
         file_obj = s3_hook.get_key(key=file_key, bucket_name=self.bucket_name)
@@ -165,9 +164,12 @@ class S3ParquetToPostgresOperator(BaseOperator):
         total_rows = 0
         for batch in parquet_file.iter_batches(batch_size=self.batch_size):
             df_chunk = batch.to_pandas()
+            
+            # [수정된 전처리 로직 사용]
             df_chunk = self._preprocess_data(df_chunk)
             
             csv_buffer = io.StringIO()
+            # na_rep='\\N' -> Pandas의 NaT/NaN/None을 Postgres의 NULL(\N)로 변환
             df_chunk.to_csv(csv_buffer, index=False, header=False, sep='\t', na_rep='\\N')
             csv_buffer.seek(0)
             
