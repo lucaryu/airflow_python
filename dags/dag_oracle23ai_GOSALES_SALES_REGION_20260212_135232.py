@@ -11,11 +11,36 @@ from datetime import timedelta
 
 # 1. Oracle 조회 쿼리 (날짜 변수 없음 -> 전체 조회)
 SOURCE_SQL = """
-    SELECT SALES_REGION_ID
-     , NAME
-     , DESCRIPTION
-     , CREATED_AT
-     , UPDATED_AT
+    SELECT SALES_REGION_CODE
+     , SALES_REGION_EN
+     , SALES_REGION_AR
+     , SALES_REGION_CS
+     , SALES_REGION_DA
+     , SALES_REGION_DE
+     , SALES_REGION_EL
+     , SALES_REGION_ES
+     , SALES_REGION_FI
+     , SALES_REGION_FR
+     , SALES_REGION_HR
+     , SALES_REGION_HU
+     , SALES_REGION_ID
+     , SALES_REGION_IT
+     , SALES_REGION_JA
+     , SALES_REGION_KK
+     , SALES_REGION_KO
+     , SALES_REGION_MS
+     , SALES_REGION_NL
+     , SALES_REGION_NO
+     , SALES_REGION_PL
+     , SALES_REGION_PT
+     , SALES_REGION_RO
+     , SALES_REGION_RU
+     , SALES_REGION_SC
+     , SALES_REGION_SL
+     , SALES_REGION_SV
+     , SALES_REGION_TC
+     , SALES_REGION_TH
+     , SALES_REGION_TR
      , SYSDATE AS ETL_CRY_DTM
   FROM GOSALES.SALES_REGION
 """
@@ -45,7 +70,7 @@ params = {
 }
 
 with DAG(
-    dag_id='dag_oracle23ai_GOSALES_SALES_REGION_20260212_140631',
+    dag_id='dag_oracle23ai_GOSALES_SALES_REGION_20260219_143716',
     default_args=default_args,
     schedule=None,
     params=params,
