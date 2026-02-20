@@ -10,9 +10,9 @@ import gc
 class S3ParquetToPostgresOperator(BaseOperator):
     """
     [Smart Loader Operator]
-    S3 -> Postgres 적재 (변경된 파일명 규칙 적용)
-    1. Full Load: {prefix}/{prefix}_full.parquet 파일 1개만 적재
-    2. Incremental: {prefix}/{YYYY}/{YYYYMM}/{prefix}_{YYYYMM}.parquet 파일 적재
+    S3 -> Postgres 적재
+    - Full Load: {prefix}/{prefix}_full.parquet 최신 파일 1개만 적재
+    - Incremental: {prefix}/{YYYY}/{YYYYMM}/{prefix}_{YYYYMM}.parquet 적재
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table', 'key_prefix', 'date_column')
@@ -47,20 +47,29 @@ class S3ParquetToPostgresOperator(BaseOperator):
         return pg_hook.get_conn()
 
     def _preprocess_data(self, df):
-        # 1. 날짜 변환
+        """데이터 타입별 NULL 처리 및 형변환"""
+        
+        # 컬럼들의 실제 데이터 타입(Type) 분류
+        num_cols = df.select_dtypes(include=['number']).columns
+        obj_cols = df.select_dtypes(include=['object', 'string']).columns
+
+        # 1. 날짜 컬럼 강제 변환
         date_keywords = ['DATE', 'TIME', 'SINCE', 'DT', 'TIMESTAMP', 'DAY']
         for col in df.columns:
             if any(k in col.upper() for k in date_keywords):
+                # ▼▼▼ [핵심 수정] 숫자형(int, float 등)이거나 문자열(object)이면 날짜 변환에서 무조건 제외 ▼▼▼
+                if col in num_cols or col in obj_cols:
+                    continue 
                 df[col] = pd.to_datetime(df[col], errors='coerce')
 
-        # 2. 숫자형 NULL -> 0
-        num_cols = df.select_dtypes(include=['number']).columns
-        df[num_cols] = df[num_cols].fillna(0)
+        # 2. 숫자형 컬럼만 NULL -> 0 변환
+        if len(num_cols) > 0:
+            df[num_cols] = df[num_cols].fillna(0)
         
-        # 3. 문자열 NULL -> \N
-        obj_cols = df.select_dtypes(include=['object']).columns
-        for col in obj_cols:
-            df[col] = df[col].fillna('\\N').astype(str).str.strip()
+        # 3. 문자열 컬럼 처리 (NULL -> \N)
+        if len(obj_cols) > 0:
+            for col in obj_cols:
+                df[col] = df[col].fillna('\\N').astype(str).str.strip()
         
         return df
 
@@ -83,7 +92,6 @@ class S3ParquetToPostgresOperator(BaseOperator):
                 cursor.execute(f"TRUNCATE TABLE {self.target_table}")
                 conn.commit()
 
-                # [규칙 변경] 테이블명_full.parquet 파일만 콕 집어서 찾음
                 filename = f"{self.key_prefix}_full.parquet"
                 file_key = f"{self.key_prefix}/{filename}"
                 
@@ -124,7 +132,6 @@ class S3ParquetToPostgresOperator(BaseOperator):
                         self.log.info(f"🧹 기간 삭제 실행 ({year}-{month})")
                         cursor.execute(delete_sql)
 
-                    # [규칙 변경] 경로 형식 맞춤
                     filename = f"{self.key_prefix}_{yyyymm}.parquet"
                     file_key = f"{self.key_prefix}/{year}/{yyyymm}/{filename}"
                     
