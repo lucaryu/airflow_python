@@ -11,8 +11,8 @@ class S3ParquetToPostgresOperator(BaseOperator):
     """
     [Smart Loader Operator]
     S3 -> Postgres 적재
-    - Full Load: {prefix}/{prefix}_full.parquet 최신 파일 1개만 적재
-    - Incremental: {prefix}/{YYYY}/{YYYYMM}/{prefix}_{YYYYMM}.parquet 적재
+    - Full Load: {prefix}/{prefix}_full.{ext} 최신 파일 1개만 적재
+    - Incremental: {prefix}/{YYYY}/{YYYYMM}/{prefix}_{YYYYMM}.{ext} 적재
     """
     
     template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table', 'key_prefix', 'date_column')
@@ -27,6 +27,9 @@ class S3ParquetToPostgresOperator(BaseOperator):
         to_date=None,
         key_prefix='taxi',
         date_column=None,
+        file_extension='parquet',
+        csv_delimiter=',',
+        csv_has_header=True,
         batch_size=100000,
         *args,
         **kwargs
@@ -40,6 +43,9 @@ class S3ParquetToPostgresOperator(BaseOperator):
         self.to_date = to_date
         self.key_prefix = key_prefix
         self.date_column = date_column
+        self.file_extension = file_extension
+        self.csv_delimiter = csv_delimiter
+        self.csv_has_header = csv_has_header
         self.batch_size = batch_size
 
     def _get_postgres_conn(self):
@@ -92,7 +98,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
                 cursor.execute(f"TRUNCATE TABLE {self.target_table}")
                 conn.commit()
 
-                filename = f"{self.key_prefix}_full.parquet"
+                filename = f"{self.key_prefix}_full.{self.file_extension}"
                 file_key = f"{self.key_prefix}/{filename}"
                 
                 self.log.info(f"📂 파일 탐색: {file_key}")
@@ -132,7 +138,7 @@ class S3ParquetToPostgresOperator(BaseOperator):
                         self.log.info(f"🧹 기간 삭제 실행 ({year}-{month})")
                         cursor.execute(delete_sql)
 
-                    filename = f"{self.key_prefix}_{yyyymm}.parquet"
+                    filename = f"{self.key_prefix}_{yyyymm}.{self.file_extension}"
                     file_key = f"{self.key_prefix}/{year}/{yyyymm}/{filename}"
                     
                     if s3_hook.check_for_key(file_key, bucket_name=self.bucket_name):
@@ -155,26 +161,63 @@ class S3ParquetToPostgresOperator(BaseOperator):
         
         file_obj = s3_hook.get_key(key=file_key, bucket_name=self.bucket_name)
         data_stream = io.BytesIO(file_obj.get()['Body'].read())
-        parquet_file = pq.ParquetFile(data_stream)
-        
-        target_columns = parquet_file.schema.names
         
         total_rows = 0
-        for batch in parquet_file.iter_batches(batch_size=self.batch_size):
-            df_chunk = batch.to_pandas()
-            df_chunk = self._preprocess_data(df_chunk)
+        if self.file_extension.lower() == 'parquet':
+            parquet_file = pq.ParquetFile(data_stream)
+            target_columns = parquet_file.schema.names
             
-            csv_buffer = io.StringIO()
-            df_chunk.to_csv(csv_buffer, index=False, header=False, sep='\t', na_rep='\\N')
-            csv_buffer.seek(0)
-            
-            cursor.copy_expert(
-                f"COPY {self.target_table} ({', '.join(target_columns)}) FROM STDIN", 
-                csv_buffer
-            )
-            total_rows += len(df_chunk)
-            del df_chunk, csv_buffer
-            gc.collect()
+            for batch in parquet_file.iter_batches(batch_size=self.batch_size):
+                df_chunk = batch.to_pandas()
+                df_chunk = self._preprocess_data(df_chunk)
+                
+                csv_buffer = io.StringIO()
+                df_chunk.to_csv(csv_buffer, index=False, header=False, sep='\t', na_rep='\\N')
+                csv_buffer.seek(0)
+                
+                cursor.copy_expert(
+                    f"COPY {self.target_table} ({', '.join(target_columns)}) FROM STDIN", 
+                    csv_buffer
+                )
+                total_rows += len(df_chunk)
+                del df_chunk, csv_buffer
+                gc.collect()
+        elif self.file_extension.lower() == 'csv':
+            header_param = 'infer' if self.csv_has_header else None
+            for df_chunk in pd.read_csv(data_stream, sep=self.csv_delimiter, header=header_param, chunksize=self.batch_size):
+                
+                # 헤더가 없는 경우 임의의 컬럼명이 생성되므로 Postgres 테이블 컬럼 순서대로 들어간다고 가정
+                if not self.csv_has_header:
+                    # Postgres 테이블의 실제 컬럼들을 조회해서 매핑할 수도 있으나,
+                    # 성능 및 복잡성을 위해 단순히 순환하며 DataFrame의 컬럼 개수만큼 처리하도록 함
+                    target_columns = [f"col_{i}" for i in range(len(df_chunk.columns))]
+                    df_chunk.columns = target_columns
+                else:
+                    target_columns = df_chunk.columns.tolist()
+                    
+                df_chunk = self._preprocess_data(df_chunk)
+                
+                csv_buffer = io.StringIO()
+                df_chunk.to_csv(csv_buffer, index=False, header=False, sep='\t', na_rep='\\N')
+                csv_buffer.seek(0)
+                
+                # 헤더가 없으면 COPY 시에 대상 컬럼을 명시하지 않거나, 생성된 컬럼으로 복사됨
+                # 대상 테이블 스키마와 1:1 매핑된다고 가정
+                if not self.csv_has_header:
+                     cursor.copy_expert(
+                        f"COPY {self.target_table} FROM STDIN", 
+                        csv_buffer
+                    )
+                else:
+                    cursor.copy_expert(
+                        f"COPY {self.target_table} ({', '.join(target_columns)}) FROM STDIN", 
+                        csv_buffer
+                    )
+                total_rows += len(df_chunk)
+                del df_chunk, csv_buffer
+                gc.collect()
+        else:
+            raise ValueError(f"지원하지 않는 확장자입니다: {self.file_extension}")
             
         conn.commit()
         self.log.info(f"✅ 적재 완료: {total_rows}건")
