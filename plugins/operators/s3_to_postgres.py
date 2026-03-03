@@ -95,8 +95,9 @@ class S3ParquetToPostgresOperator(BaseOperator):
             # =========================================================
             if not has_date:
                 self.log.info(f"📦 [Full Load] 날짜 범위 없음 -> 테이블({self.target_table}) TRUNCATE 실행")
-                cursor.execute(f"TRUNCATE TABLE {self.target_table}")
+                cursor.execute(f"TRUNCATE TABLE {self.target_table} RESTART IDENTITY CASCADE")
                 conn.commit()
+                self.log.info(f"✅ TRUNCATE 완료: {self.target_table}")
 
                 filename = f"{self.key_prefix}_full.{self.file_extension}"
                 file_key = f"{self.key_prefix}/{filename}"
