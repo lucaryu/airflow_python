@@ -17,7 +17,7 @@ class S3ToOracleOperator(BaseOperator):
     - Incremental: {prefix}/{YYYY}/{YYYYMM}/{prefix}_{YYYYMM}.{ext} 적재
     """
     
-    template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table', 'key_prefix', 'date_column')
+    template_fields = ('from_date', 'to_date', 'bucket_name', 'target_table', 'key_prefix', 'date_column', 'file_extension', 'csv_delimiter', 'csv_has_header')
 
     def __init__(
         self,
@@ -201,10 +201,14 @@ class S3ToOracleOperator(BaseOperator):
                 gc.collect()
                 
         elif self.file_extension.lower() == 'csv':
-            header_param = 'infer' if self.csv_has_header else None
+            has_header = self.csv_has_header
+            if isinstance(has_header, str):
+                has_header = has_header.lower() in ['true', '1', 't', 'y', 'yes']
+
+            header_param = 'infer' if has_header else None
             for df_chunk in pd.read_csv(data_stream, sep=self.csv_delimiter, header=header_param, chunksize=self.batch_size):
                 
-                if not self.csv_has_header:
+                if not has_header:
                     target_columns = [f"col_{i}" for i in range(len(df_chunk.columns))]
                     df_chunk.columns = target_columns
                 else:
