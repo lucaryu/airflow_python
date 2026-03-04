@@ -14,7 +14,7 @@ default_args = {
 with DAG(
     dag_id='10_s3_csv_to_oracle',
     default_args=default_args,
-    schedule_interval=None, # 수동 실행
+    schedule=None, # 수동 실행
     catchup=False,
     tags=['s3', 'oracle', 'csv', 'kkbox']
 ) as dag:
