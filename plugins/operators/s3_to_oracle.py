@@ -8,6 +8,7 @@ import oracledb
 import pyarrow.parquet as pq
 import gc
 import numpy as np
+from datetime import datetime
 
 class S3ToOracleOperator(BaseOperator):
     """
@@ -206,7 +207,7 @@ class S3ToOracleOperator(BaseOperator):
         total_rows = 0
         if self.file_extension.lower() == 'parquet':
             parquet_file = pq.ParquetFile(data_stream)
-            target_columns = parquet_file.schema.names
+            target_columns = parquet_file.schema.names + ['ETL_CRY_DTM']
             
             insert_sql = f"""
             INSERT INTO {self.target_table} ({', '.join(target_columns)}) 
@@ -216,6 +217,7 @@ class S3ToOracleOperator(BaseOperator):
             for batch in parquet_file.iter_batches(batch_size=self.batch_size):
                 df_chunk = batch.to_pandas()
                 df_chunk = self._preprocess_data(df_chunk)
+                df_chunk['ETL_CRY_DTM'] = datetime.now()
                 
                 rows = [tuple(x) for x in df_chunk.to_numpy()]
                 cursor.executemany(insert_sql, rows)
@@ -237,8 +239,10 @@ class S3ToOracleOperator(BaseOperator):
                     df_chunk.columns = target_columns
                 else:
                     target_columns = df_chunk.columns.tolist()
-                    
+                
                 df_chunk = self._preprocess_data(df_chunk)
+                df_chunk['ETL_CRY_DTM'] = datetime.now()
+                target_columns = target_columns + ['ETL_CRY_DTM']
                 
                 insert_sql = f"""
                 INSERT INTO {self.target_table} ({', '.join(target_columns)}) 
