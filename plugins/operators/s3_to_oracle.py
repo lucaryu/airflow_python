@@ -107,16 +107,21 @@ class S3ToOracleOperator(BaseOperator):
                 conn.commit()
                 self.log.info(f"✅ TRUNCATE 완료: {self.target_table}")
 
+                # prefix 처리 (트레일링 슬래시 제거)
+                clean_prefix = self.key_prefix.rstrip('/')
+                
                 # 우선 확장자가 이미 key_prefix에 포함된 경우인지 확인
-                if self.key_prefix.endswith(f".{self.file_extension}"):
-                    file_key = self.key_prefix
+                if clean_prefix.endswith(f".{self.file_extension}"):
+                    file_key = clean_prefix
                 else:
-                    filename = f"{self.key_prefix}_full.{self.file_extension}"
-                    file_key = f"{self.key_prefix}/{filename}"
+                    # prefix의 마지막 부분(basename)을 파일명으로 사용
+                    base_name = clean_prefix.split('/')[-1]
+                    filename = f"{base_name}_full.{self.file_extension}"
+                    file_key = f"{clean_prefix}/{filename}"
                     
                     if not s3_hook.check_for_key(file_key, bucket_name=self.bucket_name):
-                        # 폴백: prefix.ext 가 존재하는지 확인 (예: kkbox-churn-prediction-challenge/train.csv)
-                        fallback_key = f"{self.key_prefix}.{self.file_extension}"
+                        # 폴백: clean_prefix.ext 가 존재하는지 확인 (예: kkbox-churn-prediction-challenge/train.csv)
+                        fallback_key = f"{clean_prefix}.{self.file_extension}"
                         self.log.info(f"⚠️ {file_key} 가 없어 {fallback_key} 를 탐색합니다.")
                         if s3_hook.check_for_key(fallback_key, bucket_name=self.bucket_name):
                             file_key = fallback_key
@@ -155,8 +160,10 @@ class S3ToOracleOperator(BaseOperator):
                         self.log.info(f"🧹 기간 삭제 실행 ({year}-{month})")
                         cursor.execute(delete_sql)
 
-                    filename = f"{self.key_prefix}_{yyyymm}.{self.file_extension}"
-                    file_key = f"{self.key_prefix}/{year}/{yyyymm}/{filename}"
+                    clean_prefix = self.key_prefix.rstrip('/')
+                    base_name = clean_prefix.split('/')[-1]
+                    filename = f"{base_name}_{yyyymm}.{self.file_extension}"
+                    file_key = f"{clean_prefix}/{year}/{yyyymm}/{filename}"
                     
                     if s3_hook.check_for_key(file_key, bucket_name=self.bucket_name):
                         self._load_single_file(s3_hook, cursor, file_key, conn)
