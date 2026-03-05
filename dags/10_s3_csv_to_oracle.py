@@ -20,7 +20,7 @@ with DAG(
     tags=['s3', 'oracle', 'csv', 'kkbox'],
     params={
         "target_table": Param("members_v3", type="string", description="Oracle 타겟 테이블명"),
-        "key_prefix": Param("kkbox-churn-prediction-challenge/members_v3", type="string", description="S3 파일 경로 탐색 규칙 (Prefix)"),
+        "key_prefix": Param("kkbox-churn-prediction-challenge/members_v3.csv/members_v3.csv", type="string", description="S3 파일 경로 탐색 규칙 (Prefix)"),
         "file_extension": Param("csv", enum=["csv", "parquet"], description="파일 확장자 (csv 또는 parquet)"),
         "csv_delimiter": Param(",", type="string", description="CSV 구분자"),
         "csv_has_header": Param(True, type="boolean", description="CSV 헤더 존재 여부 (예: True/False)"),

@@ -90,10 +90,26 @@ class S3ToOracleOperator(BaseOperator):
         
         return df
 
+    def _resolve_file_extension(self):
+        """key_prefix에서 파일 확장자를 자동 추출. 추출 불가 시 self.file_extension 반환"""
+        clean = self.key_prefix.rstrip('/')
+        parts = clean.split('.')
+        if len(parts) > 1:
+            ext = parts[-1].lower()
+            if ext in ('csv', 'parquet', 'json', 'txt'):
+                return ext
+        return self.file_extension
+
     def execute(self, context):
         conn = self._get_oracle_conn()
         cursor = conn.cursor()
         s3_hook = S3Hook(aws_conn_id=self.minio_conn_id)
+
+        # key_prefix가 전체 파일 경로(확장자 포함)인 경우 자동으로 file_extension 추출
+        resolved_ext = self._resolve_file_extension()
+        if resolved_ext != self.file_extension:
+            self.log.info(f"🔍 file_extension 자동 추출: '{self.file_extension}' → '{resolved_ext}' (key_prefix 기준)")
+            self.file_extension = resolved_ext
 
         try:
             def is_valid_date(d):
@@ -110,9 +126,10 @@ class S3ToOracleOperator(BaseOperator):
                 # prefix 처리 (트레일링 슬래시 제거)
                 clean_prefix = self.key_prefix.rstrip('/')
                 
-                # 우선 확장자가 이미 key_prefix에 포함된 경우인지 확인
+                # key_prefix가 이미 완전한 파일 경로(확장자 포함)인 경우 바로 사용
                 if clean_prefix.endswith(f".{self.file_extension}"):
                     file_key = clean_prefix
+                    self.log.info(f"📂 전체 파일 경로 직접 사용: {file_key}")
                 else:
                     # prefix의 마지막 부분(basename)을 파일명으로 사용
                     base_name = clean_prefix.split('/')[-1]
