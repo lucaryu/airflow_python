@@ -19,8 +19,8 @@ with DAG(
     catchup=False,
     tags=['s3', 'oracle', 'csv', 'kkbox'],
     params={
-        "target_table": Param("KKBOX_MEMBERS", type="string", description="Oracle 타겟 테이블명"),
-        "key_prefix": Param("kkbox-churn-prediction-challenge/members_v3", type="string", description="S3 파일 경로 탐색 규칙 (Prefix)"),
+        "target_table": Param("members_v3", type="string", description="Oracle 타겟 테이블명"),
+        "key_prefix": Param("kkbox-churn-prediction-challenge/members_v3.csv/", type="string", description="S3 파일 경로 탐색 규칙 (Prefix)"),
         "file_extension": Param("csv", enum=["csv", "parquet"], description="파일 확장자 (csv 또는 parquet)"),
         "csv_delimiter": Param(",", type="string", description="CSV 구분자"),
         "csv_has_header": Param(True, type="boolean", description="CSV 헤더 존재 여부 (예: True/False)"),
@@ -34,7 +34,7 @@ with DAG(
     # 해당 타겟 테이블(target_table)은 Oracle DB에 미리 생성되어 있어야 합니다.
     # =========================================================================
 
-    load_train_csv = S3ToOracleOperator(
+    load_csv = S3ToOracleOperator(
         task_id='load_train_csv',
         oracle_conn_id='oracle_conn',       # Airflow Connection ID (Oracle)
         minio_conn_id='minio_conn',         # Airflow Connection ID (MinIO/S3)
@@ -49,4 +49,4 @@ with DAG(
         batch_size=50000                    # 한 번에 INSERT 할 배치 사이즈
     )
 
-    load_train_csv 
+    load_csv 
